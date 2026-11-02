@@ -107,6 +107,17 @@ CHECKS = [
      lambda: text("eve", "SELECT snapshot_id FROM ice.sales.`orders$snapshots`"), DENIED),
     ("bob orders$files (masked, filtered)", "0001",
      lambda: text("bob", "SELECT lower_bounds, upper_bounds FROM ice.sales.`orders$files`"), DENIED),
+    # SELECT * has the table's own columns for every user: a policy rewrite must not add _file and _pos.
+    ("alice SELECT * orders", "-",
+     lambda: text("alice", "SELECT * FROM ice.sales.orders ORDER BY id"), ORDERS_ALL),
+    ("bob SELECT * orders (mask+filter)", "0003",
+     lambda: text("bob", "SELECT * FROM ice.sales.orders ORDER BY id"), ORDERS_BOB),
+    ("bob SELECT o.* orders (mask+filter)", "0003",
+     lambda: text("bob", "SELECT o.* FROM ice.sales.orders o ORDER BY id"), ORDERS_BOB),
+    # Guards 0003: the hidden columns stay nameable under a policy (an Iceberg DELETE reads them).
+    ("bob SELECT _file, _pos orders (filter)", "guard",
+     lambda: text("bob", "SELECT id, _pos FROM ice.sales.orders WHERE _file IS NOT NULL ORDER BY id"),
+     lambda r: isinstance(r, list) and [row[0] for row in r] == [1, 3]),
 ]
 
 
