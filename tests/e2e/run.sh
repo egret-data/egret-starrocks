@@ -145,5 +145,12 @@ fi
 
 status=0
 "$PY" -I "$HERE/checks.py" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" || status=1
-"$PY" -I "$HERE/audit_checks.py" "$SR_PORT" || status=1
+if ! "$PY" -I "$HERE/audit_checks.py" "$SR_PORT"; then
+    status=1
+    echo "--- fe.log, AuditLoader and stream load lines"
+    docker exec "$NAME-sr" sh -c 'grep -i -E "audit|stream.?load|plugin" /data/deploy/starrocks/fe/log/fe.log /data/deploy/starrocks/fe/log/fe.warn.log | tail -60' || true
+    echo "--- be.INFO, stream load lines"
+    docker exec "$NAME-sr" sh -c 'grep -i -E "stream.?load|starrocks_audit" /data/deploy/starrocks/be/log/be.INFO | tail -30' || true
+    root -e "SELECT count(*) FROM starrocks_audit_db__.starrocks_audit_tbl__; SHOW PARTITIONS FROM starrocks_audit_db__.starrocks_audit_tbl__" || true
+fi
 exit $status
