@@ -5,6 +5,7 @@ starrocks_audit_db__.starrocks_audit_tbl__. Each check looks for the row of one 
 through one path, and compares who, how and with what result it was recorded. Exit code 1 when any
 check fails. All checks are tagged "audit": they fail on an image without the plugin.
 """
+import re
 import sys
 import time
 
@@ -15,6 +16,9 @@ TABLE = "starrocks_audit_db__.starrocks_audit_tbl__"
 # A statement with a double quote, a backslash and a newline: the plugin built its JSON without
 # escaping, so this broke the whole batch and every event in it was lost (patch auditloader/0001).
 MARKER = 'SELECT \'egret-audit "marker" \\\\ end\' AS a,\n  2 AS b'
+# StarRocks itself folds a line break and the blanks around it into one space before the plugin sees the
+# statement (measured: "AS a,\n  2" is stored "AS a, 2"); quotes and backslashes reach the table as sent.
+MARKER_STORED = re.sub(r"\s*\n\s*", " ", MARKER)
 
 
 def connect(user="root", password=""):
@@ -50,11 +54,11 @@ def wait_for_marker():
         conn.close()
     deadline = time.time() + 60
     while time.time() < deadline:
-        found = recorded("stmt LIKE %s", ("%egret-audit%marker%",))
+        found = recorded("`user` = 'alice' AND stmt LIKE %s", ("%egret-audit%marker%",))
         if isinstance(found, list) and found:
             return found
         time.sleep(2)
-    return recorded("stmt LIKE %s", ("%egret-audit%marker%",))
+    return recorded("`user` = 'alice' AND stmt LIKE %s", ("%egret-audit%marker%",))
 
 
 def one(where, args=()):
@@ -72,7 +76,7 @@ def has(user, auth, state, command, source="EXTERNAL"):
 CUSTOMERS = "SELECT id, phone FROM default_catalog.demo.customers WHERE id >= 0 ORDER BY id"
 ORDERS_TEXT = "SELECT id, region, email FROM ice.sales.orders WHERE id >= 0 ORDER BY id"
 CHECKS = [
-    ("the marker statement (quote, backslash, newline) is stored verbatim", lambda: None, None),
+    ("the marker statement (quote, backslash, line break) is stored", lambda: None, None),
     ("bob text query", one("`user` = 'bob' AND stmt = %s", (CUSTOMERS,)),
      has("bob", "'bob'", "EOF", "MySQL.Query")),
     ("eve denied text query", one("`user` = 'eve' AND stmt = %s", (CUSTOMERS,)),
@@ -101,7 +105,7 @@ def main():
     for name, actual_fn, expected in CHECKS:
         if expected is None:
             actual = marker
-            ok = isinstance(marker, list) and len(marker) == 1 and marker[0][5] == MARKER and marker[0][0] == "alice"
+            ok = isinstance(marker, list) and len(marker) == 1 and marker[0][5] == MARKER_STORED and marker[0][0] == "alice"
             if isinstance(marker, list):
                 print("  marker sent:   " + repr(MARKER))
                 for r in marker:
