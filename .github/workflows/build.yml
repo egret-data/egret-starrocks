@@ -1,0 +1,51 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["*-egret.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Install thrift and protoc
+        run: sudo apt-get update && sudo apt-get install -y thrift-compiler protobuf-compiler
+
+      - name: Apply patches
+        run: scripts/apply.sh
+
+      - name: Build FE jars
+        run: scripts/build-fe.sh
+
+      - name: Build images
+        run: REGISTRY=ghcr.io/${{ github.repository_owner }} scripts/build-images.sh
+
+      - name: Security e2e
+        run: |
+          source UPSTREAM
+          tests/e2e/run.sh "ghcr.io/${{ github.repository_owner }}/egret-starrocks-allin1:${UPSTREAM_TAG}-egret.${EGRET_PATCH_LEVEL}"
+
+      - name: Push images
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          source UPSTREAM
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for kind in fe allin1; do
+            docker push "ghcr.io/${{ github.repository_owner }}/egret-starrocks-${kind}:${UPSTREAM_TAG}-egret.${EGRET_PATCH_LEVEL}"
+          done

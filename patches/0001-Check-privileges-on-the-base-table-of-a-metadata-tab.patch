@@ -1,0 +1,424 @@
+From 10ddb9447106e4828424b980be1f9ebf26e7e04b Mon Sep 17 00:00:00 2001
+From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
+Date: Mon, 2 Nov 2026 15:21:53 +0700
+Subject: [PATCH 1/2] Check privileges on the base table of a metadata table
+
+ColumnPrivilege.check skipped every MetadataTable, so a user refused SELECT
+on an Iceberg table could read t$files, t$entries, t$manifests, t$partitions
+and the other metadata tables, which expose per-column lower and upper
+bounds, partition values and row counts of the base table. A user subject to
+a row access or column masking policy could read the bounds of masked
+columns and of filtered rows the same way.
+
+Reading a metadata table now requires table-level SELECT on its base table
+and is refused when a row access or column masking policy on the base table
+applies to the user. Metadata collect jobs, which run as root on behalf of an
+already-checked query, are not checked.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../catalog/iceberg/iceberg_meta_table.md     |   6 +
+ .../catalog/iceberg/iceberg_meta_table.md     |   6 +
+ .../catalog/iceberg/iceberg_meta_table.md     |   6 +
+ .../authorization/ColumnPrivilege.java        |  66 +++++-
+ .../ColumnPrivilegeMetadataTableTest.java     | 215 ++++++++++++++++++
+ .../java/com/starrocks/common/ErrorCode.java  |   3 +
+ 6 files changed, 301 insertions(+), 1 deletion(-)
+ create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/ColumnPrivilegeMetadataTableTest.java
+
+diff --git a/docs/en/data_source/catalog/iceberg/iceberg_meta_table.md b/docs/en/data_source/catalog/iceberg/iceberg_meta_table.md
+index c21e6a22818..330d009f2bc 100644
+--- a/docs/en/data_source/catalog/iceberg/iceberg_meta_table.md
++++ b/docs/en/data_source/catalog/iceberg/iceberg_meta_table.md
+@@ -24,6 +24,12 @@ Currently, StarRocks supports the following Iceberg metadata tables:
+ | `files`                | Shows details about the data files and delete files in the current snapshot of the table. |
+ | `refs`                 | Shows details about the Iceberg references, including branches and tags. |
+ 
++:::note
++
++Querying a metadata table requires the SELECT privilege on its base table. Metadata tables expose per-column lower and upper bounds and partition values, to which row access and column masking policies cannot be applied. Therefore, a user to whom a row access policy or a column masking policy on the base table applies cannot query the metadata tables of that table.
++
++:::
++
+ ## Iceberg v3 Row Lineage Metadata Columns
+ 
+ From v4.1 onwards, for Iceberg v3 tables (format-version = 3), StarRocks supports querying the following Row Lineage metadata columns:
+diff --git a/docs/ja/data_source/catalog/iceberg/iceberg_meta_table.md b/docs/ja/data_source/catalog/iceberg/iceberg_meta_table.md
+index 6586c4fe783..abb19187a58 100644
+--- a/docs/ja/data_source/catalog/iceberg/iceberg_meta_table.md
++++ b/docs/ja/data_source/catalog/iceberg/iceberg_meta_table.md
+@@ -24,6 +24,12 @@ description: "StarRocks v3.4.1 以降で Iceberg テーブルのメタデータ
+ | `files`                | テーブルの現在のスナップショット内のデータファイルと削除ファイルの詳細を表示します。 |
+ | `refs`                 | Iceberg の参照に関する詳細を表示し、ブランチやタグを含みます。 |
+ 
++:::note
++
++メタデータテーブルをクエリするには、元のテーブルに対する SELECT 権限が必要です。メタデータテーブルは各列の下限値・上限値およびパーティション値を公開しますが、行アクセスポリシーと列マスキングポリシーはこれらに適用できません。そのため、元のテーブルの行アクセスポリシーまたは列マスキングポリシーが適用されるユーザーは、そのテーブルのメタデータテーブルをクエリできません。
++
++:::
++
+ ## Iceberg v3 Row Lineage メタデータ列
+ 
+ バージョン v4.1 以降、Iceberg v3 テーブル（format-version = 3）の場合、StarRocks は以下の Row Lineage メタデータ列のクエリをサポートしています：
+diff --git a/docs/zh/data_source/catalog/iceberg/iceberg_meta_table.md b/docs/zh/data_source/catalog/iceberg/iceberg_meta_table.md
+index d827941ac91..fbc627b897d 100644
+--- a/docs/zh/data_source/catalog/iceberg/iceberg_meta_table.md
++++ b/docs/zh/data_source/catalog/iceberg/iceberg_meta_table.md
+@@ -24,6 +24,12 @@ description: "Iceberg 元数据表提供 Iceberg 表的变更历史、快照和
+ | `files`                | 显示当前快照中数据文件（Data File）和删除文件（Delete File）的详细信息。 |
+ | `refs`                 | 显示关于 Iceberg 引用（Reference）的详细信息，包括分支和标签。 |
+ 
++:::note
++
++查询元数据表需要拥有其原始表的 SELECT 权限。元数据表会暴露各列的最小值、最大值以及分区值，而行级访问策略和列脱敏策略无法作用于这些信息。因此，如果原始表上的行级访问策略或列脱敏策略对某个用户生效，该用户将无法查询该表的元数据表。
++
++:::
++
+ ## Iceberg v3 Row Lineage 元数据列
+ 
+ 从 v4.1 开始，对于 Iceberg v3 表（format-version = 3），StarRocks 支持查询以下行血缘（Row Lineage）相关的元数据列：
+diff --git a/fe/fe-core/src/main/java/com/starrocks/authorization/ColumnPrivilege.java b/fe/fe-core/src/main/java/com/starrocks/authorization/ColumnPrivilege.java
+index 1fc1debc78d..0d72c522ba2 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/authorization/ColumnPrivilege.java
++++ b/fe/fe-core/src/main/java/com/starrocks/authorization/ColumnPrivilege.java
+@@ -21,8 +21,11 @@ import com.starrocks.catalog.Table;
+ import com.starrocks.catalog.TableName;
+ import com.starrocks.catalog.View;
+ import com.starrocks.catalog.system.SystemTable;
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
+ import com.starrocks.connector.metadata.MetadataTable;
+ import com.starrocks.qe.ConnectContext;
++import com.starrocks.server.GlobalStateMgr;
+ import com.starrocks.sql.analyzer.Analyzer;
+ import com.starrocks.sql.analyzer.Authorizer;
+ import com.starrocks.sql.ast.AstTraverser;
+@@ -32,6 +35,7 @@ import com.starrocks.sql.ast.QueryStatement;
+ import com.starrocks.sql.ast.TableRelation;
+ import com.starrocks.sql.ast.UpdateStmt;
+ import com.starrocks.sql.ast.ViewRelation;
++import com.starrocks.sql.ast.expression.Expr;
+ import com.starrocks.sql.optimizer.OptExpression;
+ import com.starrocks.sql.optimizer.OptExpressionVisitor;
+ import com.starrocks.sql.optimizer.Optimizer;
+@@ -72,7 +76,12 @@ public class ColumnPrivilege {
+             TableName tableName = entry.getKey();
+             Table table = entry.getValue();
+ 
+-            if (excludeTables.contains(tableName) || table instanceof MetadataTable) {
++            if (excludeTables.contains(tableName)) {
++                continue;
++            }
++
++            if (table instanceof MetadataTable metadataTable) {
++                checkMetadataTablePrivilege(context, tableName, metadataTable);
+                 continue;
+             }
+ 
+@@ -128,6 +137,7 @@ public class ColumnPrivilege {
+             TableName tableName = entry.getKey();
+             Table table = entry.getValue();
+ 
++            // A metadata table was checked against its base table in the first loop.
+             if (excludeTables.contains(tableName) || table instanceof MetadataTable) {
+                 continue;
+             }
+@@ -186,6 +196,60 @@ public class ColumnPrivilege {
+         }
+     }
+ 
++    /**
++     * A metadata table such as {@code t$files}, {@code t$entries}, {@code t$manifests} or {@code t$partitions}
++     * exposes data of its base table {@code t}: per-file row counts, per-column lower and upper bounds (actual
++     * column values) and partition values. Reading one therefore requires SELECT on {@code t} itself, checked at
++     * table level so that a user granted only some of t's columns does not read the bounds of the others.
++     *
++     * <p>It is also refused to a user whom a row access policy or a column masking policy on {@code t} applies
++     * to: neither policy can be applied to file-level statistics, so the metadata table would show such a user
++     * the bounds of masked columns and of the rows the filter removes.
++     */
++    public static void checkMetadataTablePrivilege(ConnectContext context, TableName tableName, MetadataTable table) {
++        // A metadata collect job (MetadataCollectJob) reads t$logical_iceberg_metadata as root on behalf of a
++        // query whose privileges on t were already checked. Root is still subject to row access and masking
++        // policies under an external access controller, so checking the job would refuse that query's planning.
++        if (context.isMetadataContext()) {
++            return;
++        }
++        String catalog = tableName.getCatalog() == null ? table.getCatalogName() : tableName.getCatalog();
++        String db = tableName.getDb() == null ? table.getOriginDb() : tableName.getDb();
++        TableName baseTableName = new TableName(catalog, db, table.getOriginTable());
++
++        try {
++            Authorizer.checkTableAction(context, baseTableName.getCatalog(), baseTableName.getDb(),
++                    baseTableName.getTbl(), PrivilegeType.SELECT);
++        } catch (AccessDeniedException e) {
++            AccessDeniedException.reportAccessDenied(
++                    baseTableName.getCatalog(),
++                    context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
++                    PrivilegeType.SELECT.name(), ObjectType.TABLE.name(), baseTableName.getTbl());
++        }
++
++        if (isRestrictedByPolicy(context, baseTableName)) {
++            throw ErrorReportException.report(ErrorCode.ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY,
++                    tableName.getTbl(), baseTableName.getTbl());
++        }
++    }
++
++    private static boolean isRestrictedByPolicy(ConnectContext context, TableName baseTableName) {
++        if (Authorizer.getRowAccessPolicy(context, baseTableName) != null) {
++            return true;
++        }
++        Table baseTable = GlobalStateMgr.getCurrentState().getMetadataMgr()
++                .getTable(context, baseTableName.getCatalog(), baseTableName.getDb(), baseTableName.getTbl());
++        if (baseTable == null) {
++            // Nothing to ask the masking policy about; creating the metadata table needed the base table anyway.
++            return false;
++        }
++        // The columns SecurityPolicyRewriteRule would mask on the base table.
++        List<Column> columns = baseTable.getBaseSchema().stream()
++                .filter(c -> !c.getType().isUnknown()).filter(Column::isVisible).toList();
++        Map<String, Expr> masking = Authorizer.getColumnMaskingPolicy(context, baseTableName, columns);
++        return masking != null && !masking.isEmpty();
++    }
++
+     /**
+      * Check privilege for a view (including security view).
+      * For a security view, the user must have SELECT privilege on the view itself AND
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/ColumnPrivilegeMetadataTableTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/ColumnPrivilegeMetadataTableTest.java
+new file mode 100644
+index 00000000000..54320520218
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/ColumnPrivilegeMetadataTableTest.java
+@@ -0,0 +1,215 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.catalog.Column;
++import com.starrocks.catalog.InternalCatalog;
++import com.starrocks.catalog.TableName;
++import com.starrocks.catalog.UserIdentity;
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
++import com.starrocks.connector.metadata.MetadataTable;
++import com.starrocks.connector.metadata.iceberg.IcebergRefsTable;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.Analyzer;
++import com.starrocks.sql.analyzer.Authorizer;
++import com.starrocks.sql.ast.AstTraverser;
++import com.starrocks.sql.ast.QueryStatement;
++import com.starrocks.sql.ast.TableRelation;
++import com.starrocks.sql.ast.expression.BoolLiteral;
++import com.starrocks.sql.ast.expression.Expr;
++import com.starrocks.sql.ast.expression.NullLiteral;
++import com.starrocks.sql.parser.SqlParser;
++import com.starrocks.utframe.StarRocksAssert;
++import com.starrocks.utframe.UtFrameUtils;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * A metadata table (t$files, t$partitions, ...) exposes column bounds and partition values of its base table t,
++ * so reading it must need SELECT on t, and must be refused to a user whom a row access or masking policy on t
++ * applies to.
++ */
++public class ColumnPrivilegeMetadataTableTest {
++    private static final String CATALOG = InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
++
++    private StubAccessController controller;
++    private ConnectContext ctx;
++
++    /** An external access controller whose answers each test sets. */
++    private static class StubAccessController extends ExternalAccessController {
++        boolean allowSelect = true;
++        Expr rowAccessPolicy = null;
++        Map<String, Expr> maskingPolicy = null;
++        final List<TableName> selectChecked = new ArrayList<>();
++
++        @Override
++        public void checkTableAction(ConnectContext context, TableName tableName, PrivilegeType privilegeType)
++                throws AccessDeniedException {
++            selectChecked.add(tableName);
++            if (!allowSelect) {
++                throw new AccessDeniedException();
++            }
++        }
++
++        @Override
++        public void checkColumnAction(ConnectContext context, TableName tableName, String column,
++                                      PrivilegeType privilegeType) {
++        }
++
++        @Override
++        public Expr getRowAccessPolicy(ConnectContext context, TableName tableName) {
++            return rowAccessPolicy;
++        }
++
++        @Override
++        public Map<String, Expr> getColumnMaskingPolicy(ConnectContext context, TableName tableName,
++                                                        List<Column> columns) {
++            return maskingPolicy;
++        }
++    }
++
++    @BeforeAll
++    public static void beforeClass() throws Exception {
++        UtFrameUtils.createMinStarRocksCluster();
++        ConnectContext root = UtFrameUtils.createDefaultCtx();
++        new StarRocksAssert(root).withDatabase("db").useDatabase("db").withTable("CREATE TABLE `t1` (\n" +
++                "  `id` bigint NULL,\n" +
++                "  `email` varchar(64) NULL\n" +
++                ") ENGINE=OLAP\n" +
++                "DUPLICATE KEY(`id`)\n" +
++                "DISTRIBUTED BY HASH(`id`) BUCKETS 1\n" +
++                "PROPERTIES (\"replication_num\" = \"1\");");
++    }
++
++    @BeforeEach
++    public void setUp() {
++        controller = new StubAccessController();
++        Authorizer.getInstance().setAccessControl(CATALOG, controller);
++        ctx = new ConnectContext();
++        ctx.setCurrentUserIdentity(new UserIdentity("frank", "%"));
++        ctx.setDatabase("db");
++        ctx.setThreadLocalInfo();
++    }
++
++    @AfterEach
++    public void tearDown() {
++        Authorizer.getInstance().setAccessControl(CATALOG, new NativeAccessController());
++    }
++
++    private static MetadataTable metadataTableOfT1() {
++        return IcebergRefsTable.create(CATALOG, "db", "t1");
++    }
++
++    private static TableName metadataTableName() {
++        return new TableName(CATALOG, "db", "t1$refs");
++    }
++
++    private static ErrorCode errorCodeOf(Runnable check) {
++        ErrorReportException e = Assertions.assertThrows(ErrorReportException.class, check::run);
++        return e.getErrorCode();
++    }
++
++    @Test
++    public void testRefusedWithoutSelectOnBaseTable() {
++        controller.allowSelect = false;
++
++        ErrorCode code = errorCodeOf(() ->
++                ColumnPrivilege.checkMetadataTablePrivilege(ctx, metadataTableName(), metadataTableOfT1()));
++
++        Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER, code);
++        Assertions.assertEquals(List.of(new TableName(CATALOG, "db", "t1")), controller.selectChecked,
++                "SELECT must be checked on the base table, not on the metadata table name");
++    }
++
++    @Test
++    public void testAllowedWithSelectAndNoPolicy() {
++        Assertions.assertDoesNotThrow(() ->
++                ColumnPrivilege.checkMetadataTablePrivilege(ctx, metadataTableName(), metadataTableOfT1()));
++        Assertions.assertEquals(1, controller.selectChecked.size());
++    }
++
++    @Test
++    public void testRefusedWhenRowAccessPolicyApplies() {
++        controller.rowAccessPolicy = new BoolLiteral(false);
++
++        ErrorCode code = errorCodeOf(() ->
++                ColumnPrivilege.checkMetadataTablePrivilege(ctx, metadataTableName(), metadataTableOfT1()));
++
++        Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY, code);
++    }
++
++    @Test
++    public void testRefusedWhenColumnMaskingPolicyApplies() {
++        controller.maskingPolicy = Map.of("email", new NullLiteral());
++
++        ErrorCode code = errorCodeOf(() ->
++                ColumnPrivilege.checkMetadataTablePrivilege(ctx, metadataTableName(), metadataTableOfT1()));
++
++        Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY, code);
++    }
++
++    @Test
++    public void testEmptyMaskingPolicyDoesNotRefuse() {
++        controller.maskingPolicy = Collections.emptyMap();
++
++        Assertions.assertDoesNotThrow(() ->
++                ColumnPrivilege.checkMetadataTablePrivilege(ctx, metadataTableName(), metadataTableOfT1()));
++    }
++
++    @Test
++    public void testMetadataCollectJobIsNotChecked() {
++        controller.allowSelect = false;
++        controller.rowAccessPolicy = new BoolLiteral(false);
++        ctx.setMetadataContext(true);
++
++        Assertions.assertDoesNotThrow(() ->
++                ColumnPrivilege.checkMetadataTablePrivilege(ctx, metadataTableName(), metadataTableOfT1()));
++        Assertions.assertTrue(controller.selectChecked.isEmpty());
++    }
++
++    /**
++     * Through {@link ColumnPrivilege#check}: before the fix a metadata table was skipped entirely, so this query
++     * passed for a user refused SELECT on the base table.
++     */
++    @Test
++    public void testCheckDoesNotSkipMetadataTable() throws Exception {
++        controller.allowSelect = false;
++        QueryStatement stmt = (QueryStatement) SqlParser.parse("select id from db.t1",
++                ctx.getSessionVariable().getSqlMode()).get(0);
++        Analyzer.analyze(stmt, ctx);
++        MetadataTable metadataTable = metadataTableOfT1();
++        new AstTraverser<Void, Void>() {
++            @Override
++            public Void visitTable(TableRelation node, Void context) {
++                node.setTable(metadataTable);
++                return null;
++            }
++        }.visit(stmt);
++
++        ErrorCode code = errorCodeOf(() -> ColumnPrivilege.check(ctx, stmt, Collections.emptyList()));
++
++        Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_FOR_EXTERNAL_ACCESS_CONTROLLER, code);
++        Assertions.assertTrue(controller.selectChecked.contains(new TableName(CATALOG, "db", "t1")));
++    }
++}
+diff --git a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
+index 3db98d1878c..d35759ef4a0 100644
+--- a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
++++ b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
+@@ -270,6 +270,9 @@ public enum ErrorCode {
+             "Access denied; User %s matches more than one LDAP user when ignoring case. " +
+                     "The conflicting user names are in the FE log; an administrator must remove all " +
+                     "but one of them, or set authentication_ldap_case_insensitive = false"),
++    ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY(5210, new byte[] {'4', '2', '0', '0', '0'},
++            "Access denied; metadata table %s is not available because a row access or column masking " +
++                    "policy applies to table %s for this user"),
+ 
+     /**
+      * 5300 - 5399: Lock and Transaction
+-- 
+2.50.1 (Apple Git-155)
+

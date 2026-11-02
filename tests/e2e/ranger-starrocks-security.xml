@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+  <property><name>ranger.plugin.starrocks.service.name</name><value>e2e</value></property>
+  <property><name>ranger.plugin.starrocks.policy.rest.url</name><value>http://host.docker.internal:18777/ranger</value></property>
+  <property><name>ranger.plugin.starrocks.policy.source.impl</name><value>org.apache.ranger.admin.client.RangerAdminRESTClient</value></property>
+  <property><name>ranger.plugin.starrocks.policy.cache.dir</name><value>/tmp/ranger/e2e/policycache</value></property>
+  <property><name>ranger.plugin.starrocks.policy.pollIntervalMs</name><value>5000</value></property>
+</configuration>

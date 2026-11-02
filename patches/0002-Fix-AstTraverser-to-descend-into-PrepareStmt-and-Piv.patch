@@ -1,0 +1,98 @@
+From eabad0509f48434ae73571a139c02ebaaf6c21a9 Mon Sep 17 00:00:00 2001
+From: Karteek Yadavilli <21700785+thedataengineer@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 22:23:29 -0400
+Subject: [PATCH 2/2] Fix AstTraverser to descend into PrepareStmt and
+ PivotRelation for security policies (#78176)
+
+Signed-off-by: Karteek Yadavilli <21700785+thedataengineer@users.noreply.github.com>
+---
+ .../com/starrocks/sql/ast/AstTraverser.java   | 16 ++++++++
+ .../ranger/RangerInterfaceTest.java           | 40 +++++++++++++++++++
+ 2 files changed, 56 insertions(+)
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/ast/AstTraverser.java b/fe/fe-core/src/main/java/com/starrocks/sql/ast/AstTraverser.java
+index 20a038539d4..9f71a278872 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/ast/AstTraverser.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/ast/AstTraverser.java
+@@ -28,6 +28,14 @@ public class AstTraverser<R, C> implements AstVisitorExtendInterface<R, C> {
+         return null;
+     }
+ 
++    @Override
++    public R visitPrepareStatement(PrepareStmt statement, C context) {
++        if (statement.getInnerStmt() != null) {
++            visit(statement.getInnerStmt(), context);
++        }
++        return null;
++    }
++
+     // ------------------------------------------- DML Statement -------------------------------------------------------
+ 
+     @Override
+@@ -191,6 +199,14 @@ public class AstTraverser<R, C> implements AstVisitorExtendInterface<R, C> {
+         return visit(node.getQueryStatement(), context);
+     }
+ 
++    @Override
++    public R visitPivotRelation(PivotRelation node, C context) {
++        if (node.getQuery() != null) {
++            visit(node.getQuery(), context);
++        }
++        return null;
++    }
++
+     // ------------------------------------------- Expression --------------------------------==------------------------
+ 
+     @Override
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/ranger/RangerInterfaceTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/ranger/RangerInterfaceTest.java
+index c14f9094426..401e0f040d6 100644
+--- a/fe/fe-core/src/test/java/com/starrocks/authorization/ranger/RangerInterfaceTest.java
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/ranger/RangerInterfaceTest.java
+@@ -902,4 +902,44 @@ public class RangerInterfaceTest {
+         Assertions.assertFalse(scanColumns.containsKey(null),
+                 "scanColumns must NOT contain a null key (silent drop guard). Got: " + scanColumns);
+     }
++
++    @Test
++    public void testAstTraverserSetsNeedRewrittenByPolicyOnPrepareStmt() throws Exception {
++        String sql = "PREPARE p1 FROM 'SELECT v1, v2 FROM db.t1 WHERE k1 = ?'";
++        StatementBase stmt = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
++
++        List<Relation> relations = Lists.newArrayList();
++        new AstTraverser<Void, Void>() {
++            @Override
++            public Void visitRelation(Relation relation, Void context) {
++                relation.setNeedRewrittenByPolicy(true);
++                relations.add(relation);
++                return null;
++            }
++        }.visit(stmt);
++
++        Assertions.assertFalse(relations.isEmpty(), "AstTraverser must visit relations inside PrepareStmt");
++        Assertions.assertTrue(relations.get(0).isNeedRewrittenByPolicy(),
++                "Relations inside PrepareStmt must have needRewrittenByPolicy set to true");
++    }
++
++    @Test
++    public void testAstTraverserSetsNeedRewrittenByPolicyOnPivot() throws Exception {
++        String sql = "SELECT * FROM db.t1 PIVOT (SUM(v1) FOR v2 IN (1, 2))";
++        StatementBase stmt = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
++
++        List<Relation> relations = Lists.newArrayList();
++        new AstTraverser<Void, Void>() {
++            @Override
++            public Void visitRelation(Relation relation, Void context) {
++                relation.setNeedRewrittenByPolicy(true);
++                relations.add(relation);
++                return null;
++            }
++        }.visit(stmt);
++
++        Assertions.assertFalse(relations.isEmpty(), "AstTraverser must visit relations inside Pivot");
++        Assertions.assertTrue(relations.stream().allMatch(Relation::isNeedRewrittenByPolicy),
++                "Relations inside Pivot must have needRewrittenByPolicy set to true");
++    }
+ }
+-- 
+2.50.1 (Apple Git-155)
+
