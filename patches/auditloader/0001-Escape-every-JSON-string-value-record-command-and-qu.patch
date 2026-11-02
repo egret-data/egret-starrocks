@@ -1,0 +1,161 @@
+From 5495b69990fe6562b89fbbcbc29655717c1f3c2b Mon Sep 17 00:00:00 2001
+From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
+Date: Mon, 2 Nov 2026 21:10:24 +0700
+Subject: [PATCH] Escape every JSON string value; record command and
+ querySource
+
+The plugin built each event's JSON by concatenation without escaping, so a
+statement containing a quote, a backslash or a newline broke the JSON of the
+whole batch, and the stream load then dropped every event in it, other
+users' included: a user could keep their own statements, and anyone else's
+in the same batch, out of the audit table. Every string value now goes
+through json() (RFC 8259 escaping), null stays null.
+
+Also record AuditEvent.command (MySQL.Query, HTTP.Query,
+ARROW_FLIGHT_SQL.Query, ...) and querySource (EXTERNAL, MV, ...), read by
+name so older releases without them still load.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../plugin/audit/AuditLoaderPlugin.java       | 86 +++++++++++++++----
+ .../plugin/audit/StarrocksStreamLoader.java   |  2 +-
+ 2 files changed, 69 insertions(+), 19 deletions(-)
+
+diff --git a/src/main/java/com/starrocks/plugin/audit/AuditLoaderPlugin.java b/src/main/java/com/starrocks/plugin/audit/AuditLoaderPlugin.java
+index 4c7b62d..ff61c70 100644
+--- a/src/main/java/com/starrocks/plugin/audit/AuditLoaderPlugin.java
++++ b/src/main/java/com/starrocks/plugin/audit/AuditLoaderPlugin.java
+@@ -176,17 +176,20 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
+         String candidateMvsVal = candidateMvsExists ? event.candidateMvs : "";
+         String hitMVsVal = hitMVsExists ? event.hitMVs : "";
+         String queriedRelationsVal = queriedRelationsExists ? getQueriedRelationsJson(event) : "null";
+-        String content = "{\"queryId\":\"" + getQueryId(queryType, event) + "\"," +
+-                "\"timestamp\":\"" + longToTimeString(event.timestamp) + "\"," +
+-                "\"queryType\":\"" + queryType + "\"," +
+-                "\"clientIp\":\"" + event.clientIp + "\"," +
+-                "\"user\":\"" + event.user + "\"," +
+-                "\"authorizedUser\":\"" + event.authorizedUser + "\"," +
+-                "\"resourceGroup\":\"" + event.resourceGroup + "\"," +
+-                "\"catalog\":\"" + event.catalog + "\"," +
+-                "\"db\":\"" + event.db + "\"," +
+-                "\"state\":\"" + event.state + "\"," +
+-                "\"errorCode\":\"" + event.errorCode + "\"," +
++        // Every string value goes through json(): a quote, backslash or newline in a statement (or a user
++        // name) left unescaped breaks the JSON of the whole batch, and the stream load then drops every
++        // event in it, other users' included.
++        String content = "{\"queryId\":" + json(getQueryId(queryType, event)) + "," +
++                "\"timestamp\":" + json(longToTimeString(event.timestamp)) + "," +
++                "\"queryType\":" + json(queryType) + "," +
++                "\"clientIp\":" + json(event.clientIp) + "," +
++                "\"user\":" + json(event.user) + "," +
++                "\"authorizedUser\":" + json(event.authorizedUser) + "," +
++                "\"resourceGroup\":" + json(event.resourceGroup) + "," +
++                "\"catalog\":" + json(event.catalog) + "," +
++                "\"db\":" + json(event.db) + "," +
++                "\"state\":" + json(event.state) + "," +
++                "\"errorCode\":" + json(event.errorCode) + "," +
+                 "\"queryTime\":" + event.queryTime + "," +
+                 "\"scanBytes\":" + event.scanBytes + "," +
+                 "\"scanRows\":" + event.scanRows + "," +
+@@ -195,16 +198,18 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
+                 "\"memCostBytes\":" + event.memCostBytes + "," +
+                 "\"stmtId\":" + event.stmtId + "," +
+                 "\"isQuery\":" + isQuery + "," +
+-                "\"feIp\":\"" + event.feIp + "\"," +
+-                "\"stmt\":\"" + truncateByBytes(event.stmt) + "\"," +
+-                "\"digest\":\"" + event.digest + "\"," +
++                "\"feIp\":" + json(event.feIp) + "," +
++                "\"stmt\":" + json(event.stmt == null ? null : truncateByBytes(event.stmt)) + "," +
++                "\"digest\":" + json(event.digest) + "," +
+                 "\"planCpuCosts\":" + event.planCpuCosts + "," +
+                 "\"planMemCosts\":" + event.planMemCosts + "," +
+                 "\"pendingTimeMs\":" + event.pendingTimeMs + "," +
+-                "\"candidateMVs\":\"" + candidateMvsVal + "\"," +
+-                "\"hitMvs\":\"" + hitMVsVal + "\"," +
++                "\"candidateMVs\":" + json(candidateMvsVal) + "," +
++                "\"hitMvs\":" + json(hitMVsVal) + "," +
+                 "\"QueriedRelations\":" + queriedRelationsVal + "," +
+-                "\"warehouse\":\"" + event.warehouse + "\"}";
++                "\"warehouse\":" + json(event.warehouse) + "," +
++                "\"command\":" + json(stringField(event, "command")) + "," +
++                "\"querySource\":" + json(stringField(event, "querySource")) + "}";
+         if (auditBuffer.length() > 0) {
+             auditBuffer.append(",");
+         }
+@@ -285,6 +290,51 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
+         }
+     }
+ 
++    /** A JSON string literal of `value` (RFC 8259 escaping), or null. */
++    static String json(String value) {
++        if (value == null) {
++            return "null";
++        }
++        StringBuilder out = new StringBuilder(value.length() + 2).append('"');
++        for (int i = 0; i < value.length(); i++) {
++            char c = value.charAt(i);
++            switch (c) {
++                case '"':
++                    out.append("\\\"");
++                    break;
++                case '\\':
++                    out.append("\\\\");
++                    break;
++                case '\n':
++                    out.append("\\n");
++                    break;
++                case '\r':
++                    out.append("\\r");
++                    break;
++                case '\t':
++                    out.append("\\t");
++                    break;
++                default:
++                    if (c < 0x20) {
++                        out.append(String.format("\\u%04x", (int) c));
++                    } else {
++                        out.append(c);
++                    }
++            }
++        }
++        return out.append('"').toString();
++    }
++
++    /** A String field of the event that older StarRocks releases do not have (read by name), or "". */
++    private static String stringField(AuditEvent event, String name) {
++        try {
++            Object value = AuditEvent.class.getField(name).get(event);
++            return value == null ? "" : value.toString();
++        } catch (Exception e) {
++            return "";
++        }
++    }
++
+     private String getQueriedRelationsJson(AuditEvent event) {
+         try {
+             Field queriedRelationsField = AuditEvent.class.getDeclaredField("queriedRelations");
+@@ -293,7 +343,7 @@ public class AuditLoaderPlugin extends Plugin implements AuditPlugin {
+                 return "null";
+             }
+             return "[" + queriedRelations.stream()
+-                    .map(relation -> "\"" + relation + "\"")
++                    .map(AuditLoaderPlugin::json)
+                     .collect(Collectors.joining(",")) + "]";
+         } catch (Exception e) {
+             LOG.debug("encounter exception when getting queriedRelations from audit event", e);
+diff --git a/src/main/java/com/starrocks/plugin/audit/StarrocksStreamLoader.java b/src/main/java/com/starrocks/plugin/audit/StarrocksStreamLoader.java
+index 6b4ba85..65c3f83 100644
+--- a/src/main/java/com/starrocks/plugin/audit/StarrocksStreamLoader.java
++++ b/src/main/java/com/starrocks/plugin/audit/StarrocksStreamLoader.java
+@@ -89,7 +89,7 @@ public class StarrocksStreamLoader {
+ 
+         conn.addRequestProperty("label", label);
+         conn.addRequestProperty("max_filter_ratio", "1.0");
+-        conn.addRequestProperty("columns", "queryId,timestamp,queryType,clientIp,user,authorizedUser,resourceGroup,catalog,db,state,errorCode,queryTime,scanBytes,scanRows,returnRows,cpuCostNs,memCostBytes,stmtId,isQuery,feIp,stmt,digest,planCpuCosts,planMemCosts,pendingTimeMs,candidateMVs,hitMvs,QueriedRelations,warehouse");
++        conn.addRequestProperty("columns", "queryId,timestamp,queryType,clientIp,user,authorizedUser,resourceGroup,catalog,db,state,errorCode,queryTime,scanBytes,scanRows,returnRows,cpuCostNs,memCostBytes,stmtId,isQuery,feIp,stmt,digest,planCpuCosts,planMemCosts,pendingTimeMs,candidateMVs,hitMvs,QueriedRelations,warehouse,command,querySource");
+         if(!StringUtils.isBlank(this.streamLoadFilter)) {
+             conn.addRequestProperty("where", streamLoadFilter);
+         }
+-- 
+2.50.1 (Apple Git-155)
+

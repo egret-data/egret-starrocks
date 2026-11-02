@@ -64,6 +64,9 @@ jobs:
       - name: Build FE jars
         run: scripts/build-fe.sh
 
+      - name: Build AuditLoader
+        run: scripts/build-auditloader.sh
+
       - name: Build images
         run: REGISTRY=ghcr.io/${{ github.repository_owner }} scripts/build-images.sh
 

@@ -114,6 +114,29 @@ CREATE USER mallory IDENTIFIED BY 'mallorypw';
 CREATE USER tina IDENTIFIED BY 'tinapw';
 EOF
 
+# The AuditLoader plugin, when the image ships it (egret's images do, the official ones do not): the
+# table egret creates on every engine, a loader user with INSERT on it only, a 5 second batch.
+if docker exec "$NAME-sr" test -f /opt/egret/auditloader.zip; then
+    root < "$HERE/audit-table.sql"
+    root -e "CREATE USER egret_audit IDENTIFIED BY 'auditpw'"
+    root -e 'INSTALL PLUGIN FROM "/opt/egret/auditloader.zip" PROPERTIES ("user" = "egret_audit", "password" = "auditpw", "max_batch_interval_sec" = "5", "frontend_host_port" = "127.0.0.1:8030")'
+    root -e 'SHOW PLUGINS\G' | grep -E 'Name: AuditLoader|Status' | head -4
+    # StarRocks hands audit events only to the audit plugins it knew at its last refresh, once a minute
+    # (AuditEventProcessor.UPDATE_PLUGIN_INTERVAL_MS): wait until a probe statement reaches the table.
+    echo "waiting for the AuditLoader to receive events"
+    for _ in $(seq 1 60); do
+        root -N -e "SELECT 'egret-audit-probe'" >/dev/null
+        n=$(root -N -e "SELECT count(*) FROM starrocks_audit_db__.starrocks_audit_tbl__ WHERE stmt LIKE '%egret-audit-probe%' AND \`user\` = 'root' AND stmt NOT LIKE '%starrocks_audit_tbl__%'")
+        if [ "$n" != 0 ]; then
+            echo "AuditLoader is loading"
+            break
+        fi
+        sleep 2
+    done
+else
+    echo "this image ships no AuditLoader: the audit checks will fail"
+fi
+
 echo "waiting for the Ranger plugin to load the policies"
 for _ in $(seq 1 30); do
     grep -q 'lastKnownVersion=1' "$WORK/ranger.log" 2>/dev/null && break
@@ -132,4 +155,19 @@ else
     echo "the plugin never requested the tags"
 fi
 
-"$PY" -I "$HERE/checks.py" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT"
+status=0
+echo "checks start $(date -u +%T)"
+"$PY" -I "$HERE/checks.py" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" || status=1
+echo "audit checks start $(date -u +%T)"
+if ! "$PY" -I "$HERE/audit_checks.py" "$SR_PORT"; then
+    status=1
+    echo "--- fe.log, AuditLoader and stream load lines"
+    docker exec "$NAME-sr" sh -c 'grep -i -E "audit|stream.?load|plugin" /data/deploy/starrocks/fe/log/fe.log /data/deploy/starrocks/fe/log/fe.warn.log | tail -60' || true
+    echo "--- be.INFO, stream load lines"
+    docker exec "$NAME-sr" sh -c 'grep -i -E "stream.?load|starrocks_audit" /data/deploy/starrocks/be/log/be.INFO | tail -30' || true
+    root -e "SELECT \`timestamp\`, queryType, \`user\`, state, command, querySource, left(stmt, 90) FROM starrocks_audit_db__.starrocks_audit_tbl__ ORDER BY \`timestamp\`" || true
+    echo "--- fe.audit.log tail"
+    docker exec "$NAME-sr" sh -c 'tail -5 /data/deploy/starrocks/fe/log/fe.audit.log | cut -c1-200; wc -l /data/deploy/starrocks/fe/log/fe.audit.log' || true
+    root -e 'SHOW PLUGINS\G' || true
+fi
+exit $status
