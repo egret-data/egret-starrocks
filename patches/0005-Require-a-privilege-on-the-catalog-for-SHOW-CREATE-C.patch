@@ -1,0 +1,146 @@
+From 99fba472900695909b52792f76cce56ecf0c0ca9 Mon Sep 17 00:00:00 2001
+From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
+Date: Mon, 2 Nov 2026 19:54:10 +0700
+Subject: [PATCH 5/7] Require a privilege on the catalog for SHOW CREATE
+ CATALOG
+
+SHOW CREATE CATALOG had no privilege check: any user who could log in read
+every external catalog's properties (endpoints, warehouse, and the first and
+last characters of its credentials), although SHOW CATALOGS lists only the
+catalogs the user has a privilege on. It now needs any privilege on the
+catalog, the same rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../sql/analyzer/AuthorizerStmtVisitor.java   | 20 +++++
+ .../ShowCreateCatalogPrivilegeTest.java       | 80 +++++++++++++++++++
+ 2 files changed, 100 insertions(+)
+ create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/ShowCreateCatalogPrivilegeTest.java
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
+index 2ff14c92c79..74aaedff377 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
+@@ -183,6 +183,7 @@ import com.starrocks.sql.ast.ShowColumnStmt;
+ import com.starrocks.sql.ast.ShowComputeNodeBlackListStmt;
+ import com.starrocks.sql.ast.ShowComputeNodesStmt;
+ import com.starrocks.sql.ast.ShowCreateDbStmt;
++import com.starrocks.sql.ast.ShowCreateExternalCatalogStmt;
+ import com.starrocks.sql.ast.ShowCreateTableStmt;
+ import com.starrocks.sql.ast.ShowDataDistributionStmt;
+ import com.starrocks.sql.ast.ShowDataStmt;
+@@ -867,6 +868,25 @@ public class AuthorizerStmtVisitor implements AstVisitorExtendInterface<Void, Co
+         return null;
+     }
+ 
++    @Override
++    public Void visitShowCreateExternalCatalogStatement(ShowCreateExternalCatalogStmt statement,
++                                                        ConnectContext context) {
++        // The statement prints the catalog's properties (endpoints, warehouse, the first and last characters of
++        // its credentials), so it needs a privilege on the catalog, the same as SHOW CATALOGS listing it.
++        String catalogName = statement.getCatalogName();
++        if (CatalogMgr.isInternalCatalog(catalogName)) {
++            return null;
++        }
++        try {
++            Authorizer.checkAnyActionOnCatalog(context, catalogName);
++        } catch (AccessDeniedException e) {
++            AccessDeniedException.reportAccessDenied(catalogName,
++                    context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
++                    PrivilegeType.ANY.name(), ObjectType.CATALOG.name(), catalogName);
++        }
++        return null;
++    }
++
+     @Override
+     public Void visitShowCatalogsStatement(ShowCatalogsStmt statement, ConnectContext context) {
+         // `show catalogs` only show catalog that user has any privilege on, we will check it in
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/ShowCreateCatalogPrivilegeTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/ShowCreateCatalogPrivilegeTest.java
+new file mode 100644
+index 00000000000..ff6a1946a79
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/ShowCreateCatalogPrivilegeTest.java
+@@ -0,0 +1,80 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.Authorizer;
++import com.starrocks.sql.analyzer.AuthorizerStmtVisitor;
++import com.starrocks.sql.ast.ShowCreateExternalCatalogStmt;
++import com.starrocks.sql.parser.SqlParser;
++import com.starrocks.utframe.UtFrameUtils;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++
++/**
++ * SHOW CREATE CATALOG prints a catalog's properties, so it needs a privilege on that catalog. Before, any user
++ * who could log in read every catalog's endpoints and the ends of its credentials.
++ */
++public class ShowCreateCatalogPrivilegeTest {
++    private static ConnectContext connectContext;
++
++    @BeforeAll
++    public static void beforeClass() throws Exception {
++        UtFrameUtils.createMinStarRocksCluster();
++        connectContext = UtFrameUtils.createDefaultCtx();
++    }
++
++    private static ShowCreateExternalCatalogStmt parse(String catalog) {
++        return (ShowCreateExternalCatalogStmt) SqlParser.parse("SHOW CREATE CATALOG " + catalog,
++                connectContext.getSessionVariable()).get(0);
++    }
++
++    @Test
++    public void aUserWithNoPrivilegeOnTheCatalogIsRefused() {
++        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
++            authorizer.when(() -> Authorizer.checkAnyActionOnCatalog(Mockito.any(), Mockito.eq("ice")))
++                    .thenThrow(new AccessDeniedException());
++
++            Exception e = Assertions.assertThrows(Exception.class,
++                    () -> new AuthorizerStmtVisitor().visit(parse("ice"), connectContext));
++
++            Assertions.assertTrue(e.getMessage().contains("Access denied"), e.getMessage());
++        }
++    }
++
++    @Test
++    public void aUserWithAPrivilegeOnTheCatalogPasses() {
++        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
++            authorizer.when(() -> Authorizer.checkAnyActionOnCatalog(Mockito.any(), Mockito.eq("ice")))
++                    .thenAnswer(invocation -> null);
++
++            Assertions.assertDoesNotThrow(() -> new AuthorizerStmtVisitor().visit(parse("ice"), connectContext));
++            authorizer.verify(() -> Authorizer.checkAnyActionOnCatalog(Mockito.any(), Mockito.eq("ice")));
++        }
++    }
++
++    @Test
++    public void theInternalCatalogNeedsNoCheck() {
++        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
++            Assertions.assertDoesNotThrow(
++                    () -> new AuthorizerStmtVisitor().visit(parse("default_catalog"), connectContext));
++            authorizer.verify(() -> Authorizer.checkAnyActionOnCatalog(Mockito.any(), Mockito.any()),
++                    Mockito.never());
++        }
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

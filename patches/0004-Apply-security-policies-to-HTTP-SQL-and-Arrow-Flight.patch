@@ -1,0 +1,218 @@
+From d8d29561d1e0a7e8043fe8d910c009f7bbd16519 Mon Sep 17 00:00:00 2001
+From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
+Date: Mon, 2 Nov 2026 19:54:10 +0700
+Subject: [PATCH 4/7] Apply security policies to HTTP SQL and Arrow Flight SQL
+ queries
+
+The MySQL protocol marks every relation of a statement so the analyzer
+applies column masking and row access policies to it. The FE's HTTP SQL API
+(/api/v1/catalogs/<c>/databases/<d>/sql) and Arrow Flight SQL never marked
+them, so a user under a mask or row filter read every row and column in the
+clear through either.
+
+Add SecurityPolicyRewriteRule.markRelationsForRewrite (named as in upstream
+PR #78049, which fixes the same gap on main) and call it from the HTTP SQL
+processor, the Flight SQL processor and the Flight prepared-statement schema
+analysis.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../SecurityPolicyRewriteRule.java            | 17 ++++
+ .../starrocks/http/HttpConnectProcessor.java  |  2 +
+ .../sql/ArrowFlightSqlConnectProcessor.java   |  2 +
+ .../flight/sql/ArrowFlightSqlServiceImpl.java |  2 +
+ .../SecurityPolicyMarkRelationsTest.java      | 82 +++++++++++++++++++
+ 5 files changed, 105 insertions(+)
+ create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/SecurityPolicyMarkRelationsTest.java
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/authorization/SecurityPolicyRewriteRule.java b/fe/fe-core/src/main/java/com/starrocks/authorization/SecurityPolicyRewriteRule.java
+index 909335f6ef8..572f56353ba 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/authorization/SecurityPolicyRewriteRule.java
++++ b/fe/fe-core/src/main/java/com/starrocks/authorization/SecurityPolicyRewriteRule.java
+@@ -19,11 +19,13 @@ import com.starrocks.catalog.TableName;
+ import com.starrocks.qe.ConnectContext;
+ import com.starrocks.sql.analyzer.AnalyzerUtils;
+ import com.starrocks.sql.analyzer.Authorizer;
++import com.starrocks.sql.ast.AstTraverser;
+ import com.starrocks.sql.ast.QueryStatement;
+ import com.starrocks.sql.ast.Relation;
+ import com.starrocks.sql.ast.SelectList;
+ import com.starrocks.sql.ast.SelectListItem;
+ import com.starrocks.sql.ast.SelectRelation;
++import com.starrocks.sql.ast.StatementBase;
+ import com.starrocks.sql.ast.TableRelation;
+ import com.starrocks.sql.ast.ViewRelation;
+ import com.starrocks.sql.ast.expression.Expr;
+@@ -39,6 +41,21 @@ import java.util.TreeSet;
+ import java.util.stream.Collectors;
+ 
+ public class SecurityPolicyRewriteRule {
++    /**
++     * Marks every relation of a user statement so the analyzer applies the column masking and row access
++     * policies to it. Every entry point that runs a user's SQL must call this before analysis: a relation
++     * that is not marked is read without any mask or row filter.
++     */
++    public static void markRelationsForRewrite(StatementBase statement) {
++        new AstTraverser<Void, Void>() {
++            @Override
++            public Void visitRelation(Relation relation, Void context) {
++                relation.setNeedRewrittenByPolicy(true);
++                return null;
++            }
++        }.visit(statement);
++    }
++
+     public static QueryStatement buildView(ConnectContext context, Relation relation, TableName tableName) {
+         if (relation instanceof TableRelation && ((TableRelation) relation).isSyncMVQuery()) {
+             return null;
+diff --git a/fe/fe-core/src/main/java/com/starrocks/http/HttpConnectProcessor.java b/fe/fe-core/src/main/java/com/starrocks/http/HttpConnectProcessor.java
+index 56b1ec43aa2..6e6087b29d0 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/http/HttpConnectProcessor.java
++++ b/fe/fe-core/src/main/java/com/starrocks/http/HttpConnectProcessor.java
+@@ -33,6 +33,7 @@
+ // under the License.
+ package com.starrocks.http;
+ 
++import com.starrocks.authorization.SecurityPolicyRewriteRule;
+ import com.starrocks.common.StarRocksException;
+ import com.starrocks.common.profile.Tracers;
+ import com.starrocks.metric.MetricRepo;
+@@ -74,6 +75,7 @@ public class HttpConnectProcessor extends ConnectProcessor {
+ 
+         StatementBase parsedStmt = ((HttpConnectContext) ctx).getStatement();
+         String sql = parsedStmt.getOrigStmt().originStmt;
++        SecurityPolicyRewriteRule.markRelationsForRewrite(parsedStmt);
+ 
+         executor = new StmtExecutor(ctx, parsedStmt);
+         ctx.setExecutor(executor);
+diff --git a/fe/fe-core/src/main/java/com/starrocks/service/arrow/flight/sql/ArrowFlightSqlConnectProcessor.java b/fe/fe-core/src/main/java/com/starrocks/service/arrow/flight/sql/ArrowFlightSqlConnectProcessor.java
+index 149174f19c3..32024d792f5 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/service/arrow/flight/sql/ArrowFlightSqlConnectProcessor.java
++++ b/fe/fe-core/src/main/java/com/starrocks/service/arrow/flight/sql/ArrowFlightSqlConnectProcessor.java
+@@ -14,6 +14,7 @@
+ 
+ package com.starrocks.service.arrow.flight.sql;
+ 
++import com.starrocks.authorization.SecurityPolicyRewriteRule;
+ import com.starrocks.common.Config;
+ import com.starrocks.common.StarRocksException;
+ import com.starrocks.common.profile.Timer;
+@@ -334,6 +335,7 @@ public class ArrowFlightSqlConnectProcessor extends ConnectProcessor {
+ 
+         StatementBase parsedStmt = stmts.get(0);
+         parsedStmt.setOrigStmt(new OriginStatement(sql));
++        SecurityPolicyRewriteRule.markRelationsForRewrite(parsedStmt);
+         return parsedStmt;
+     }
+ 
+diff --git a/fe/fe-core/src/main/java/com/starrocks/service/arrow/flight/sql/ArrowFlightSqlServiceImpl.java b/fe/fe-core/src/main/java/com/starrocks/service/arrow/flight/sql/ArrowFlightSqlServiceImpl.java
+index 3eb0b5ac067..d1bc8ae7835 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/service/arrow/flight/sql/ArrowFlightSqlServiceImpl.java
++++ b/fe/fe-core/src/main/java/com/starrocks/service/arrow/flight/sql/ArrowFlightSqlServiceImpl.java
+@@ -22,6 +22,7 @@ import com.google.common.collect.Maps;
+ import com.google.protobuf.Any;
+ import com.google.protobuf.ByteString;
+ import com.google.protobuf.Message;
++import com.starrocks.authorization.SecurityPolicyRewriteRule;
+ import com.starrocks.common.Config;
+ import com.starrocks.common.DdlException;
+ import com.starrocks.common.InvalidConfException;
+@@ -928,6 +929,7 @@ public class ArrowFlightSqlServiceImpl implements FlightSqlProducer, AutoCloseab
+                     return buildPlaceholderSchema();
+                 }
+                 stmt.setOrigStmt(new OriginStatement(query));
++                SecurityPolicyRewriteRule.markRelationsForRewrite(stmt);
+ 
+                 Analyzer.analyze(stmt, ctx);
+ 
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/SecurityPolicyMarkRelationsTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/SecurityPolicyMarkRelationsTest.java
+new file mode 100644
+index 00000000000..ab4685944ef
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/SecurityPolicyMarkRelationsTest.java
+@@ -0,0 +1,82 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.qe.SessionVariable;
++import com.starrocks.sql.ast.AstTraverser;
++import com.starrocks.sql.ast.Relation;
++import com.starrocks.sql.ast.StatementBase;
++import com.starrocks.sql.ast.TableRelation;
++import com.starrocks.sql.parser.SqlParser;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * {@link SecurityPolicyRewriteRule#markRelationsForRewrite} marks every table a statement reads, at any depth.
++ * The HTTP SQL API and Arrow Flight SQL call it; before they did, a query through either got no column mask
++ * and no row filter.
++ */
++public class SecurityPolicyMarkRelationsTest {
++
++    private static List<TableRelation> tables(StatementBase stmt) {
++        List<TableRelation> out = new ArrayList<>();
++        new AstTraverser<Void, Void>() {
++            @Override
++            public Void visitTable(TableRelation relation, Void context) {
++                out.add(relation);
++                return null;
++            }
++        }.visit(stmt);
++        return out;
++    }
++
++    private static List<TableRelation> markedTables(String sql) {
++        StatementBase stmt = SqlParser.parse(sql, new SessionVariable()).get(0);
++        Assertions.assertTrue(tables(stmt).stream().noneMatch(Relation::isNeedRewrittenByPolicy),
++                "a parsed statement starts unmarked");
++        SecurityPolicyRewriteRule.markRelationsForRewrite(stmt);
++        return tables(stmt);
++    }
++
++    @Test
++    public void marksEveryTableAtAnyDepth() {
++        List<TableRelation> tables = markedTables(
++                "SELECT * FROM a JOIN (SELECT * FROM b WHERE b.x IN (SELECT x FROM c)) s ON a.x = s.x " +
++                        "UNION ALL SELECT * FROM d");
++
++        Assertions.assertEquals(4, tables.size());
++        Assertions.assertTrue(tables.stream().allMatch(Relation::isNeedRewrittenByPolicy));
++    }
++
++    @Test
++    public void marksTheTablesUnderAPivot() {
++        List<TableRelation> tables = markedTables(
++                "SELECT * FROM (SELECT id, region FROM orders) t PIVOT (count(id) FOR region IN ('us', 'eu'))");
++
++        Assertions.assertEquals(1, tables.size());
++        Assertions.assertTrue(tables.get(0).isNeedRewrittenByPolicy());
++    }
++
++    @Test
++    public void marksTheSourceOfAnInsert() {
++        List<TableRelation> tables = markedTables("INSERT INTO target SELECT * FROM source");
++
++        Assertions.assertTrue(tables.stream().anyMatch(t -> t.getName().getTbl().equals("source")));
++        Assertions.assertTrue(tables.stream().allMatch(Relation::isNeedRewrittenByPolicy));
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

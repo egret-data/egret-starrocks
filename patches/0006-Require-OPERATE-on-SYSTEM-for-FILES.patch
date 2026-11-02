@@ -1,0 +1,255 @@
+From 72cfffaa81aa23d2314d8c6ea3561d62ec6f7f83 Mon Sep 17 00:00:00 2001
+From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
+Date: Mon, 2 Nov 2026 19:54:10 +0700
+Subject: [PATCH 6/7] Require OPERATE on SYSTEM for FILES()
+
+FILES() had no privilege of its own (upstream #79980, #80233): any user who
+could log in read and wrote object storage through it, with no table
+privilege, column mask or row filter, and with
+"aws.s3.use_instance_profile" through the BE's own cloud identity, which can
+reach the data files of every table.
+
+Every use (SELECT ... FROM FILES, INSERT INTO FILES, DESC FILES) now needs
+the OPERATE privilege on SYSTEM, refused with error 5211 otherwise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../authorization/FilesFunctionPrivilege.java | 43 ++++++++
+ .../sql/analyzer/InsertAnalyzer.java          |  2 +
+ .../starrocks/sql/analyzer/QueryAnalyzer.java |  2 +
+ .../sql/analyzer/ShowStmtAnalyzer.java        |  2 +
+ .../FilesFunctionPrivilegeTest.java           | 97 +++++++++++++++++++
+ .../java/com/starrocks/common/ErrorCode.java  |  3 +
+ 6 files changed, 149 insertions(+)
+ create mode 100644 fe/fe-core/src/main/java/com/starrocks/authorization/FilesFunctionPrivilege.java
+ create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/FilesFunctionPrivilegeTest.java
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/authorization/FilesFunctionPrivilege.java b/fe/fe-core/src/main/java/com/starrocks/authorization/FilesFunctionPrivilege.java
+new file mode 100644
+index 00000000000..39c0337c4af
+--- /dev/null
++++ b/fe/fe-core/src/main/java/com/starrocks/authorization/FilesFunctionPrivilege.java
+@@ -0,0 +1,43 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.Authorizer;
++
++/**
++ * FILES() reads and writes object storage directly: no table privilege, column mask or row filter applies to
++ * it, and with "aws.s3.use_instance_profile" it uses the BE's own cloud identity, which can reach the data
++ * files of every table. So every use of it (SELECT ... FROM FILES, INSERT INTO FILES, DESC FILES) needs the
++ * OPERATE privilege on SYSTEM.
++ */
++public final class FilesFunctionPrivilege {
++    private FilesFunctionPrivilege() {
++    }
++
++    public static void check(ConnectContext context) {
++        if (context == null || context.getCurrentUserIdentity() == null) {
++            // Internal work with no user session (a pre-split of an insert already checked here).
++            return;
++        }
++        try {
++            Authorizer.checkSystemAction(context, PrivilegeType.OPERATE);
++        } catch (AccessDeniedException e) {
++            throw ErrorReportException.report(ErrorCode.ERR_ACCESS_DENIED_FILES_FUNCTION);
++        }
++    }
++}
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/InsertAnalyzer.java b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/InsertAnalyzer.java
+index 9a0804de16a..893dd687747 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/InsertAnalyzer.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/InsertAnalyzer.java
+@@ -20,6 +20,7 @@ import com.google.common.collect.ImmutableSet;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Maps;
+ import com.google.common.collect.Sets;
++import com.starrocks.authorization.FilesFunctionPrivilege;
+ import com.starrocks.catalog.Column;
+ import com.starrocks.catalog.Database;
+ import com.starrocks.catalog.ExternalOlapTable;
+@@ -847,6 +848,7 @@ public class InsertAnalyzer {
+ 
+     private static Table getTargetTable(InsertStmt insertStmt, ConnectContext session) {
+         if (insertStmt.useTableFunctionAsTargetTable()) {
++            FilesFunctionPrivilege.check(session);
+             return insertStmt.makeTableFunctionTable(session.getSessionVariable());
+         } else if (insertStmt.useBlackHoleTableAsTargetTable()) {
+             return insertStmt.makeBlackHoleTable();
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/QueryAnalyzer.java b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/QueryAnalyzer.java
+index adbea164e39..ac2644e27e7 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/QueryAnalyzer.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/QueryAnalyzer.java
+@@ -21,6 +21,7 @@ import com.google.common.collect.ImmutableList;
+ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Sets;
++import com.starrocks.authorization.FilesFunctionPrivilege;
+ import com.starrocks.authorization.SecurityPolicyRewriteRule;
+ import com.starrocks.catalog.Column;
+ import com.starrocks.catalog.ConnectorView;
+@@ -2591,6 +2592,7 @@ public class QueryAnalyzer {
+     }
+ 
+     private Table resolveTableFunctionTable(Map<String, String> properties, Consumer<TableFunctionTable> pushDownSchemaFunc) {
++        FilesFunctionPrivilege.check(session);
+         try {
+             return new TableFunctionTable(properties, pushDownSchemaFunc);
+         } catch (DdlException e) {
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/ShowStmtAnalyzer.java b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/ShowStmtAnalyzer.java
+index 400fc1fa572..07d6bcf3466 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/ShowStmtAnalyzer.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/ShowStmtAnalyzer.java
+@@ -16,6 +16,7 @@ package com.starrocks.sql.analyzer;
+ 
+ import com.google.common.base.Strings;
+ import com.google.common.collect.Lists;
++import com.starrocks.authorization.FilesFunctionPrivilege;
+ import com.starrocks.catalog.Column;
+ import com.starrocks.catalog.Database;
+ import com.starrocks.catalog.MaterializedIndexMeta;
+@@ -362,6 +363,7 @@ public class ShowStmtAnalyzer {
+         }
+ 
+         private void descTableFunctionTable(DescribeStmt node, ConnectContext context) {
++            FilesFunctionPrivilege.check(context);
+             Map<String, String> tfProps = node.getTableFunctionProperties();
+             if (tfProps.containsKey(TableFunctionTable.PROPERTY_SCHEMA)) {
+                 throw new SemanticException(
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/FilesFunctionPrivilegeTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/FilesFunctionPrivilegeTest.java
+new file mode 100644
+index 00000000000..b21cf656421
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/FilesFunctionPrivilegeTest.java
+@@ -0,0 +1,97 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.Analyzer;
++import com.starrocks.sql.analyzer.Authorizer;
++import com.starrocks.sql.ast.StatementBase;
++import com.starrocks.sql.parser.SqlParser;
++import com.starrocks.utframe.StarRocksAssert;
++import com.starrocks.utframe.UtFrameUtils;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++
++/**
++ * Every use of FILES() needs the OPERATE privilege on SYSTEM: it reads and writes object storage with no table
++ * privilege, mask or row filter, and with an instance profile it uses the BE's own cloud identity.
++ */
++public class FilesFunctionPrivilegeTest {
++    private static final String FILES = "FILES('path' = 's3://bucket/data/*', 'format' = 'parquet', " +
++            "'aws.s3.use_instance_profile' = 'true', 'aws.s3.region' = 'us-east-1')";
++    private static ConnectContext connectContext;
++
++    @BeforeAll
++    public static void beforeClass() throws Exception {
++        UtFrameUtils.createMinStarRocksCluster();
++        connectContext = UtFrameUtils.createDefaultCtx();
++        new StarRocksAssert(connectContext).withDatabase("db_files").useDatabase("db_files")
++                .withTable("CREATE TABLE t (id BIGINT) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 " +
++                        "PROPERTIES ('replication_num' = '1')");
++    }
++
++    private static Throwable analyze(String sql, boolean hasOperate) {
++        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
++            if (!hasOperate) {
++                authorizer.when(() -> Authorizer.checkSystemAction(Mockito.any(), Mockito.eq(PrivilegeType.OPERATE)))
++                        .thenThrow(new AccessDeniedException());
++            }
++            StatementBase stmt = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
++            try {
++                Analyzer.analyze(stmt, connectContext);
++                return null;
++            } catch (Throwable t) {
++                return t;
++            }
++        }
++    }
++
++    private static boolean refusedForFiles(Throwable t) {
++        return t instanceof ErrorReportException e
++                && e.getErrorCode() == ErrorCode.ERR_ACCESS_DENIED_FILES_FUNCTION;
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {
++            "SELECT * FROM " + FILES,
++            "INSERT INTO db_files.t SELECT * FROM " + FILES,
++            "INSERT INTO " + FILES + " SELECT * FROM db_files.t",
++            "DESC " + FILES,
++    })
++    public void aUserWithoutOperateIsRefused(String sql) {
++        Throwable t = analyze(sql, false);
++
++        Assertions.assertTrue(refusedForFiles(t), String.valueOf(t));
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {
++            "SELECT * FROM " + FILES,
++            "INSERT INTO " + FILES + " SELECT * FROM db_files.t",
++            "DESC " + FILES,
++    })
++    public void aUserWithOperateGetsPastTheCheck(String sql) {
++        // The storage behind the path does not exist, so the statement may still fail, but not on the privilege.
++        Throwable t = analyze(sql, true);
++
++        Assertions.assertFalse(refusedForFiles(t), String.valueOf(t));
++    }
++}
+diff --git a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
+index d35759ef4a0..c537304de03 100644
+--- a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
++++ b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
+@@ -273,6 +273,9 @@ public enum ErrorCode {
+     ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY(5210, new byte[] {'4', '2', '0', '0', '0'},
+             "Access denied; metadata table %s is not available because a row access or column masking " +
+                     "policy applies to table %s for this user"),
++    ERR_ACCESS_DENIED_FILES_FUNCTION(5211, new byte[] {'4', '2', '0', '0', '0'},
++            "Access denied; FILES() reads and writes object storage without any table privilege, so it needs " +
++                    "the OPERATE privilege on SYSTEM"),
+ 
+     /**
+      * 5300 - 5399: Lock and Transaction
+-- 
+2.50.1 (Apple Git-155)
+
