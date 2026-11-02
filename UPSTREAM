@@ -5,3 +5,7 @@ UPSTREAM_COMMIT=b81ff9cc465a5f2e5e53104d87a59b349808abd9
 JAR_SUFFIX=4.1.7
 # Patch level of this fork on top of UPSTREAM_TAG; bump on every image change.
 EGRET_PATCH_LEVEL=3
+# StarRocks AuditLoader plugin (loads fe.audit.log events into a table), built from source at this
+# commit plus patches/auditloader/ and shipped in the FE images at /opt/egret/auditloader.zip.
+AUDITLOADER_URL=https://github.com/StarRocks/fe-plugins-auditloader.git
+AUDITLOADER_COMMIT=b98cfa246bb8c437ecf14caf3ff576810084003f

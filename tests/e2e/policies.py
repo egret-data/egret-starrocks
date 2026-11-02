@@ -10,6 +10,7 @@ tina:  SELECT on demo.* and ice.sales.* by resource policy; her masks, row filte
        service linked to a tag service: a TagEnricher in the service def, a tagPolicies block and the tags
        on /service/tags/download.
 svc:   IMPERSONATE on every user (the way egret's delegator queries as the user).
+egret_audit: INSERT on the audit table only, the AuditLoader plugin's stream-load user.
 mallory: bob's grant, mask and row filter on demo.customers, and she may create and fill tables, views and
        materialized views in demo: the write paths (CTAS, INSERT ... SELECT, views, materialized views) must
        not carry data past her policy.
@@ -75,6 +76,8 @@ policy("filter-customers", 2, res("default_catalog", "demo", "customers"),
        rowFilterPolicyItems=[item(["bob", "mallory"], rowFilterInfo={"filterExpr": "id = 1"})])
 policy("filter-orders", 2, res("ice", "sales", "orders"),
        rowFilterPolicyItems=[item(["bob", "root"], rowFilterInfo={"filterExpr": "region = 'us'"})])
+policy("audit-loader", 0, res("default_catalog", "starrocks_audit_db__", "starrocks_audit_tbl__"),
+       policyItems=[item(["egret_audit"], accesses=[{"type": "insert", "isAllowed": True}])])
 policy("impersonate", 0, {"user": values("*")},
        policyItems=[item(["svc"], accesses=[{"type": "impersonate", "isAllowed": True}])])
 
