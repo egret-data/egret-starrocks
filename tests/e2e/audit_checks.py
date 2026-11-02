@@ -50,11 +50,11 @@ def wait_for_marker():
         conn.close()
     deadline = time.time() + 60
     while time.time() < deadline:
-        found = recorded("stmt = %s", (MARKER,))
+        found = recorded("stmt LIKE %s", ("%egret-audit%marker%",))
         if isinstance(found, list) and found:
             return found
         time.sleep(2)
-    return recorded("stmt = %s", (MARKER,))
+    return recorded("stmt LIKE %s", ("%egret-audit%marker%",))
 
 
 def one(where, args=()):
@@ -102,6 +102,10 @@ def main():
         if expected is None:
             actual = marker
             ok = isinstance(marker, list) and len(marker) == 1 and marker[0][5] == MARKER and marker[0][0] == "alice"
+            if isinstance(marker, list):
+                print("  marker sent:   " + repr(MARKER))
+                for r in marker:
+                    print("  marker stored: " + repr(r[5]))
         else:
             actual = actual_fn()
             ok = expected(actual)
