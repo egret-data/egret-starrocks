@@ -1,0 +1,282 @@
+From 7c627fa52a7c7fdcd5c26d4463f321e06db9d08c Mon Sep 17 00:00:00 2001
+From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
+Date: Mon, 2 Nov 2026 19:14:11 +0700
+Subject: [PATCH] Keep hidden columns hidden from * when a security policy
+ rewrites a table
+
+A row access or column masking policy rewrites the table into a subquery
+that selects every column of the base schema by name, including hidden ones
+(Iceberg's _file and _pos). The subquery's output fields were all visible,
+so `SELECT *` returned the hidden columns only for users under a policy: a
+different result shape per user, broken INSERT ... SELECT * and views over
+`SELECT *` for those users.
+
+The rewritten subquery now records the table's hidden column names and keeps
+those output fields invisible, so `*` skips them as it does on the table,
+while a statement can still name them (an Iceberg DELETE reads _file and
+_pos through the same rewrite).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../SecurityPolicyRewriteRule.java            |  20 +++
+ .../starrocks/sql/analyzer/QueryAnalyzer.java |   4 +-
+ .../starrocks/sql/ast/SubqueryRelation.java   |  14 ++
+ .../SecurityPolicyHiddenColumnTest.java       | 147 ++++++++++++++++++
+ 4 files changed, 184 insertions(+), 1 deletion(-)
+ create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/SecurityPolicyHiddenColumnTest.java
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/authorization/SecurityPolicyRewriteRule.java b/fe/fe-core/src/main/java/com/starrocks/authorization/SecurityPolicyRewriteRule.java
+index 7f39aa4acc6..909335f6ef8 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/authorization/SecurityPolicyRewriteRule.java
++++ b/fe/fe-core/src/main/java/com/starrocks/authorization/SecurityPolicyRewriteRule.java
+@@ -34,6 +34,8 @@ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
+ import java.util.stream.Collectors;
+ 
+ public class SecurityPolicyRewriteRule {
+@@ -90,4 +92,22 @@ public class SecurityPolicyRewriteRule {
+         selectRelation.setOrderBy(Collections.emptyList());
+         return new QueryStatement(selectRelation);
+     }
++
++    /**
++     * The hidden columns of the relation {@link #buildView} rewrites. The view selects them by name so that a
++     * statement can still name them (an Iceberg DELETE reads _file and _pos), but `*` over the view must skip
++     * them as it skips them over the table; otherwise a user under a row access or masking policy gets extra
++     * columns in `SELECT *` that every other user does not.
++     */
++    public static Set<String> hiddenColumnNames(Relation relation) {
++        Set<String> names = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
++        if (relation instanceof TableRelation tableRelation) {
++            for (Column column : tableRelation.getTable().getBaseSchema()) {
++                if (column.isHidden()) {
++                    names.add(column.getName());
++                }
++            }
++        }
++        return names;
++    }
+ }
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/QueryAnalyzer.java b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/QueryAnalyzer.java
+index 4ff1b65392a..adbea164e39 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/QueryAnalyzer.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/QueryAnalyzer.java
+@@ -828,6 +828,7 @@ public class QueryAnalyzer {
+                 } else {
+                     r.setNeedRewrittenByPolicy(false);
+                     SubqueryRelation subqueryRelation = new SubqueryRelation(policyRewriteQuery);
++                    subqueryRelation.setHiddenColumnNames(SecurityPolicyRewriteRule.hiddenColumnNames(r));
+ 
+                     // If an alias exists, rewrite the alias into subquery to ensure
+                     // that the original expression can be resolved correctly.
+@@ -1467,8 +1468,9 @@ public class QueryAnalyzer {
+                     fieldResolveName = field.getName();
+                 }
+ 
++                boolean visible = !subquery.getHiddenColumnNames().contains(field.getName());
+                 outputFields.add(new Field(fieldResolveName, field.getType(), subquery.getResolveTableName(),
+-                        field.getOriginExpression()));
++                        field.getOriginExpression(), visible));
+ 
+             }
+             Scope scope = new Scope(RelationId.of(subquery), new RelationFields(outputFields.build()));
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/ast/SubqueryRelation.java b/fe/fe-core/src/main/java/com/starrocks/sql/ast/SubqueryRelation.java
+index e9629fff7a9..2d34e79d169 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/ast/SubqueryRelation.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/ast/SubqueryRelation.java
+@@ -18,14 +18,20 @@ import com.starrocks.sql.analyzer.FieldId;
+ import com.starrocks.sql.ast.expression.Expr;
+ import com.starrocks.sql.parser.NodePosition;
+ 
++import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
+ public class SubqueryRelation extends QueryRelation {
+     private final QueryStatement queryStatement;
+ 
+     private final boolean assertRows;
+ 
++    // Output columns that stay hidden from `*`, as they are in the relation this subquery replaces: the
++    // hidden columns of a table that a security policy rewrote into a subquery (Iceberg's _file and _pos).
++    private Set<String> hiddenColumnNames = Collections.emptySet();
++
+     public SubqueryRelation(QueryStatement queryStatement) {
+         this(queryStatement, false, queryStatement.getPos());
+     }
+@@ -45,6 +51,14 @@ public class SubqueryRelation extends QueryRelation {
+         return assertRows;
+     }
+ 
++    public Set<String> getHiddenColumnNames() {
++        return hiddenColumnNames;
++    }
++
++    public void setHiddenColumnNames(Set<String> hiddenColumnNames) {
++        this.hiddenColumnNames = hiddenColumnNames;
++    }
++
+     @Override
+     public Map<Expr, FieldId> getColumnReferences() {
+         return queryStatement.getQueryRelation().getColumnReferences();
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/SecurityPolicyHiddenColumnTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/SecurityPolicyHiddenColumnTest.java
+new file mode 100644
+index 00000000000..8392301e55c
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/SecurityPolicyHiddenColumnTest.java
+@@ -0,0 +1,147 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.catalog.Column;
++import com.starrocks.catalog.Database;
++import com.starrocks.catalog.Table;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.server.GlobalStateMgr;
++import com.starrocks.sql.analyzer.Analyzer;
++import com.starrocks.sql.analyzer.Authorizer;
++import com.starrocks.sql.ast.AstTraverser;
++import com.starrocks.sql.ast.QueryStatement;
++import com.starrocks.sql.ast.Relation;
++import com.starrocks.sql.ast.SelectRelation;
++import com.starrocks.sql.ast.StatementBase;
++import com.starrocks.sql.ast.SubqueryRelation;
++import com.starrocks.sql.ast.expression.Expr;
++import com.starrocks.sql.parser.SqlParser;
++import com.starrocks.utframe.StarRocksAssert;
++import com.starrocks.utframe.UtFrameUtils;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++
++import java.util.List;
++import java.util.Map;
++
++/**
++ * A hidden column (Iceberg's _file and _pos) stays out of `SELECT *` when a row access or column masking policy
++ * rewrites the table into a subquery, and can still be named. Before the fix the rewrite selected the hidden
++ * columns as ordinary ones, so only users under a policy got them in `SELECT *`.
++ */
++public class SecurityPolicyHiddenColumnTest {
++    private static ConnectContext connectContext;
++
++    @BeforeAll
++    public static void beforeClass() throws Exception {
++        UtFrameUtils.createMinStarRocksCluster();
++        connectContext = UtFrameUtils.createDefaultCtx();
++        StarRocksAssert starRocksAssert = new StarRocksAssert(connectContext);
++        starRocksAssert.withDatabase("db_hidden").useDatabase("db_hidden").withTable("CREATE TABLE `t_hidden` (\n" +
++                "  `v4` bigint NULL,\n" +
++                "  `v5` bigint NULL,\n" +
++                "  `v6` bigint NULL\n" +
++                ") ENGINE=OLAP\n" +
++                "DUPLICATE KEY(`v4`)\n" +
++                "DISTRIBUTED BY HASH(`v4`) BUCKETS 1\n" +
++                "PROPERTIES (\"replication_num\" = \"1\");");
++        Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb("db_hidden");
++        Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), "t_hidden");
++        // Stands in for Iceberg's _file: in the base schema, but hidden.
++        Column v6 = table.getColumn("v6");
++        v6.setIsHidden(true);
++    }
++
++    private static QueryStatement analyzeUnderPolicy(String sql, Map<String, Expr> masks, Expr rowFilter) {
++        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class)) {
++            authorizer.when(() -> Authorizer.getColumnMaskingPolicy(Mockito.any(), Mockito.any(), Mockito.any()))
++                    .thenReturn(masks);
++            authorizer.when(() -> Authorizer.getRowAccessPolicy(Mockito.any(), Mockito.any())).thenReturn(rowFilter);
++            StatementBase stmt = SqlParser.parse(sql, connectContext.getSessionVariable().getSqlMode()).get(0);
++            new AstTraverser<Void, Void>() {
++                @Override
++                public Void visitRelation(Relation relation, Void context) {
++                    relation.setNeedRewrittenByPolicy(true);
++                    return null;
++                }
++            }.visit(stmt);
++            Analyzer.analyze(stmt, connectContext);
++            return (QueryStatement) stmt;
++        }
++    }
++
++    private static Expr expr(String sql) {
++        return SqlParser.parseSqlToExpr(sql, connectContext.getSessionVariable().getSqlMode());
++    }
++
++    private static boolean rewritten(QueryStatement stmt) {
++        return ((SelectRelation) stmt.getQueryRelation()).getRelation() instanceof SubqueryRelation;
++    }
++
++    @Test
++    public void starSkipsTheHiddenColumnWithoutAPolicy() {
++        QueryStatement stmt = analyzeUnderPolicy("select * from db_hidden.t_hidden", Map.of(), null);
++
++        Assertions.assertFalse(rewritten(stmt));
++        Assertions.assertEquals(List.of("v4", "v5"), stmt.getQueryRelation().getColumnOutputNames());
++    }
++
++    @Test
++    public void starSkipsTheHiddenColumnUnderARowFilter() {
++        QueryStatement stmt = analyzeUnderPolicy("select * from db_hidden.t_hidden", Map.of(), expr("v4 > 0"));
++
++        Assertions.assertTrue(rewritten(stmt));
++        Assertions.assertEquals(List.of("v4", "v5"), stmt.getQueryRelation().getColumnOutputNames());
++    }
++
++    @Test
++    public void starSkipsTheHiddenColumnUnderAMask() {
++        QueryStatement stmt = analyzeUnderPolicy("select * from db_hidden.t_hidden t", Map.of("v5", expr("v5 + 1")),
++                null);
++
++        Assertions.assertTrue(rewritten(stmt));
++        Assertions.assertEquals(List.of("v4", "v5"), stmt.getQueryRelation().getColumnOutputNames());
++    }
++
++    @Test
++    public void qualifiedStarSkipsTheHiddenColumnUnderARowFilter() {
++        QueryStatement stmt = analyzeUnderPolicy("select t.* from db_hidden.t_hidden t", Map.of(), expr("v4 > 0"));
++
++        Assertions.assertTrue(rewritten(stmt));
++        Assertions.assertEquals(List.of("v4", "v5"), stmt.getQueryRelation().getColumnOutputNames());
++    }
++
++    @Test
++    public void theHiddenColumnCanStillBeNamedUnderARowFilter() {
++        // An Iceberg DELETE reads `SELECT _file, _pos FROM t WHERE ...` through the same rewrite.
++        QueryStatement stmt = analyzeUnderPolicy("select v4, V6 from db_hidden.t_hidden", Map.of(), expr("v4 > 0"));
++
++        Assertions.assertTrue(rewritten(stmt));
++        Assertions.assertEquals(List.of("v4", "V6"), stmt.getQueryRelation().getColumnOutputNames());
++    }
++
++    @Test
++    public void theNamesOfTheHiddenColumnsComeFromTheTable() {
++        QueryStatement stmt = analyzeUnderPolicy("select * from db_hidden.t_hidden", Map.of(), expr("v4 > 0"));
++        SubqueryRelation subquery = (SubqueryRelation) ((SelectRelation) stmt.getQueryRelation()).getRelation();
++
++        Assertions.assertTrue(subquery.getHiddenColumnNames().contains("V6"));
++        Assertions.assertEquals(1, subquery.getHiddenColumnNames().size());
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

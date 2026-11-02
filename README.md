@@ -17,6 +17,7 @@ until a StarRocks release contains it, any StarRocks with Iceberg catalogs is ex
 |---|---|---|
 | `0001` | Iceberg metadata tables (`t$files`, `t$entries`, `t$manifests`, `t$partitions`, `t$snapshots`, ...) were read without any privilege check, exposing per-column bounds, partition values and row counts of `t` to any user, and the bounds of masked columns and filtered rows to masked/filtered users. Reading one now needs table-level SELECT on `t` and is refused (error 5210) when a row access or masking policy on `t` applies to the user. | Reported to the StarRocks security team on 2026-11-02; no upstream issue or fix yet. Published here 2026-11-02. |
 | `0002` | Ranger column masks and row filters were not applied to statements run through `PREPARE`/`EXECUTE` or the MySQL binary protocol (`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`), which egret's StarRocks connector uses for parameterised queries. | Public: issue [#78176](https://github.com/StarRocks/starrocks/issues/78176), PR [#78368](https://github.com/StarRocks/starrocks/pull/78368) (cherry-picked unchanged, original author kept). |
+| `0003` | A row access or column masking policy rewrote an Iceberg table into a subquery that selected the hidden columns `_file` (the data file's object-store path) and `_pos` as ordinary ones, so `SELECT *` returned two extra columns only for users under a policy: a different result shape per user, broken `INSERT ... SELECT *`, and Iceberg views over `SELECT *` failing for those users. `*` now skips them under a policy as it does without one; a statement can still name them (an Iceberg DELETE reads them through the same rewrite). | No upstream issue or fix yet (found 2026-11-02; egret KI-337/KI-304). |
 
 Drop a patch when the upstream release in `UPSTREAM` contains it.
 
@@ -61,7 +62,11 @@ Run it against the official image too: the checks tagged with a patch number mus
 shows that each check detects what its patch fixes. Checks tagged `-` (controls) and `guard` (a
 behaviour a patch must not break) pass on both.
 
-Result on 2026-11-02 against the official `starrocks/allin1-ubuntu:4.1.7`: 8/15 passed, every
+Result on 2026-11-02 against the official `starrocks/allin1-ubuntu:4.1.7` with the `0003` checks
+added: 10/19 passed, every `0001`/`0002`/`0003` check failed; bob's `SELECT *` on `orders` returned
+`_file` (`s3://warehouse/sales/orders/data/...parquet`) and `_pos` after the table's three columns.
+
+Earlier result (patches `0001`/`0002`, 15 checks) against the official image: 8/15 passed, every
 `0001`/`0002` check failed (bob read clear phone numbers and every row through `PREPARE`, the binary
 protocol and `EXECUTE AS`; eve, with no policy, read `orders$files` bounds and `orders$snapshots`).
 Against `ghcr.io/egret-data/egret-starrocks-allin1:4.1.7-egret.1`: 15/15 passed. With 0001's
