@@ -121,6 +121,18 @@ if docker exec "$NAME-sr" test -f /opt/egret/auditloader.zip; then
     root -e "CREATE USER egret_audit IDENTIFIED BY 'auditpw'"
     root -e 'INSTALL PLUGIN FROM "/opt/egret/auditloader.zip" PROPERTIES ("user" = "egret_audit", "password" = "auditpw", "max_batch_interval_sec" = "5", "frontend_host_port" = "127.0.0.1:8030")'
     root -e 'SHOW PLUGINS\G' | grep -E 'Name: AuditLoader|Status' | head -4
+    # StarRocks hands audit events only to the audit plugins it knew at its last refresh, once a minute
+    # (AuditEventProcessor.UPDATE_PLUGIN_INTERVAL_MS): wait until a probe statement reaches the table.
+    echo "waiting for the AuditLoader to receive events"
+    for _ in $(seq 1 60); do
+        root -N -e "SELECT 'egret-audit-probe'" >/dev/null
+        n=$(root -N -e "SELECT count(*) FROM starrocks_audit_db__.starrocks_audit_tbl__ WHERE stmt LIKE '%egret-audit-probe%' AND \`user\` = 'root' AND stmt NOT LIKE '%starrocks_audit_tbl__%'")
+        if [ "$n" != 0 ]; then
+            echo "AuditLoader is loading"
+            break
+        fi
+        sleep 2
+    done
 else
     echo "this image ships no AuditLoader: the audit checks will fail"
 fi
