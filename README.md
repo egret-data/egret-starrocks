@@ -7,14 +7,15 @@ This is **not an official StarRocks build**. It is the official release image of
 [`UPSTREAM`](UPSTREAM) with two FE jars (`fe-core`, `fe-spi`) rebuilt from that tag plus
 [`patches/`](patches). Every other file in the image, and the CN/BE images, are the official ones.
 
-Keep this repository **private** while it carries a patch for an issue that upstream has not
-disclosed (see the table).
+This repository and its images are public. Patch `0001` fixes an issue that was reported privately to
+the StarRocks security team on 2026-11-02 and published here the same day, before an upstream fix:
+until a StarRocks release contains it, any StarRocks with Iceberg catalogs is exposed (see the table).
 
 ## Patches
 
 | Patch | Fixes | Upstream |
 |---|---|---|
-| `0001` | Iceberg metadata tables (`t$files`, `t$entries`, `t$manifests`, `t$partitions`, `t$snapshots`, ...) were read without any privilege check, exposing per-column bounds, partition values and row counts of `t` to any user, and the bounds of masked columns and filtered rows to masked/filtered users. Reading one now needs table-level SELECT on `t` and is refused (error 5210) when a row access or masking policy on `t` applies to the user. | Reported privately to the StarRocks security team (2026-11-02). Not public. |
+| `0001` | Iceberg metadata tables (`t$files`, `t$entries`, `t$manifests`, `t$partitions`, `t$snapshots`, ...) were read without any privilege check, exposing per-column bounds, partition values and row counts of `t` to any user, and the bounds of masked columns and filtered rows to masked/filtered users. Reading one now needs table-level SELECT on `t` and is refused (error 5210) when a row access or masking policy on `t` applies to the user. | Reported to the StarRocks security team on 2026-11-02; no upstream issue or fix yet. Published here 2026-11-02. |
 | `0002` | Ranger column masks and row filters were not applied to statements run through `PREPARE`/`EXECUTE` or the MySQL binary protocol (`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`), which egret's StarRocks connector uses for parameterised queries. | Public: issue [#78176](https://github.com/StarRocks/starrocks/issues/78176), PR [#78368](https://github.com/StarRocks/starrocks/pull/78368) (cherry-picked unchanged, original author kept). |
 
 Drop a patch when the upstream release in `UPSTREAM` contains it.
