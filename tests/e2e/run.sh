@@ -144,13 +144,18 @@ else
 fi
 
 status=0
+echo "checks start $(date -u +%T)"
 "$PY" -I "$HERE/checks.py" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" || status=1
+echo "audit checks start $(date -u +%T)"
 if ! "$PY" -I "$HERE/audit_checks.py" "$SR_PORT"; then
     status=1
     echo "--- fe.log, AuditLoader and stream load lines"
     docker exec "$NAME-sr" sh -c 'grep -i -E "audit|stream.?load|plugin" /data/deploy/starrocks/fe/log/fe.log /data/deploy/starrocks/fe/log/fe.warn.log | tail -60' || true
     echo "--- be.INFO, stream load lines"
     docker exec "$NAME-sr" sh -c 'grep -i -E "stream.?load|starrocks_audit" /data/deploy/starrocks/be/log/be.INFO | tail -30' || true
-    root -e "SELECT count(*) FROM starrocks_audit_db__.starrocks_audit_tbl__; SHOW PARTITIONS FROM starrocks_audit_db__.starrocks_audit_tbl__" || true
+    root -e "SELECT \`timestamp\`, queryType, \`user\`, state, command, querySource, left(stmt, 90) FROM starrocks_audit_db__.starrocks_audit_tbl__ ORDER BY \`timestamp\`" || true
+    echo "--- fe.audit.log tail"
+    docker exec "$NAME-sr" sh -c 'tail -5 /data/deploy/starrocks/fe/log/fe.audit.log | cut -c1-200; wc -l /data/deploy/starrocks/fe/log/fe.audit.log' || true
+    root -e 'SHOW PLUGINS\G' || true
 fi
 exit $status
