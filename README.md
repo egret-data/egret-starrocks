@@ -33,7 +33,13 @@ patches an image carries.
 
 ## Build
 
-Needs git, JDK 17+, Maven 3.9, `thrift` and `protoc` on `PATH`, Python 3, Docker.
+Published images are built only by CI (`.github/workflows/build.yml`): every push builds and runs the
+e2e, and a tag `<UPSTREAM_TAG>-egret.<EGRET_PATCH_LEVEL>` also pushes both images to GHCR. CI builds with
+JDK 17, as the official images, and with the thrift compiler version of the tag's `thirdparty/vars.sh`
+(0.24.0 for 4.1.7); Ubuntu's `thrift-compiler` package is too old.
+
+A local build is for development only. It needs git, JDK 17, Maven 3.9, `thrift` (same version as
+CI) and `protoc` on `PATH`, Python 3, Docker.
 
 ```bash
 scripts/apply.sh          # fetch the tag in UPSTREAM into work/starrocks, verify its commit, apply patches/

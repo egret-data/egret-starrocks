@@ -29,8 +29,34 @@ jobs:
           key: m2-${{ hashFiles('UPSTREAM') }}
           restore-keys: m2-
 
-      - name: Install thrift and protoc
-        run: sudo apt-get update && sudo apt-get install -y thrift-compiler protobuf-compiler
+      # The thrift compiler must match the libthrift the FE builds against (fe/pom.xml thrift.version,
+      # 0.24.0 on 4.1.7): Ubuntu's thrift-compiler 0.19 generates code that does not compile against it.
+      # Version and checksum are the ones in the tag's thirdparty/vars.sh.
+      - name: Cache thrift compiler
+        id: thrift-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/thrift
+          key: thrift-0.24.0-${{ runner.os }}
+
+      - name: Build thrift compiler 0.24.0
+        if: steps.thrift-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y bison flex g++ make
+          curl -fsSL -o /tmp/thrift.tar.gz https://archive.apache.org/dist/thrift/0.24.0/thrift-0.24.0.tar.gz
+          echo "232e035ff80c5fb4b7243f0be3a76b02  /tmp/thrift.tar.gz" | md5sum -c -
+          tar -xzf /tmp/thrift.tar.gz -C /tmp
+          cd /tmp/thrift-0.24.0
+          ./configure --prefix="$HOME/thrift" --disable-libs --disable-tests --disable-tutorial
+          make -j"$(nproc)" && make install
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          echo "$HOME/thrift/bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: thrift -version && protoc --version && java -version
 
       - name: Apply patches
         run: scripts/apply.sh
