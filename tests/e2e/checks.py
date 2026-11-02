@@ -17,7 +17,7 @@ import mysql.connector
 PORT = int(sys.argv[1])
 HTTP_PORT = int(sys.argv[2])
 FLIGHT_PORT = int(sys.argv[3])
-PASSWORDS = {"root": "", "alice": "alicepw", "bob": "bobpw", "eve": "evepw", "svc": "svcpw", "mallory": "mallorypw"}
+PASSWORDS = {"root": "", "alice": "alicepw", "bob": "bobpw", "eve": "evepw", "svc": "svcpw", "tina": "tinapw", "mallory": "mallorypw"}
 DENIED = "DENIED"
 
 CUSTOMERS_ALL = [(1, "010-1111-2222"), (2, "010-3333-4444"), (3, "010-5555-6666")]
@@ -191,6 +191,18 @@ CHECKS = [
     ("root FILES() (OPERATE on SYSTEM)", "guard",
      lambda: text("root", f"SELECT count(*) FROM {FILES_ORDERS}"), [(4,)]),
     # Write paths of a user under a mask and a row filter (mallory, on demo.customers).
+    # Tag policies: tina's mask, row filter and deny come only from tags (policies.py).
+    ("tina text customers (tag PII mask)", "tag",
+     lambda: text("tina", CUSTOMERS_SQL.format(p=0)), [(1, None), (2, None), (3, None)]),
+    ("tina text orders (tag row filter + tag PII mask)", "tag",
+     lambda: text("tina", ORDERS_SQL.format(p=0)), [(1, "us", None), (3, "us", None)]),
+    ("tina COM_STMT_EXECUTE orders (tags)", "tag", lambda: binary("tina", ORDERS_SQL), [(1, "us", None), (3, "us", None)]),
+    ("tina SELECT grade (tag SECRET deny)", "tag",
+     lambda: text("tina", "SELECT grade FROM default_catalog.demo.customers"), DENIED),
+    ("tina SELECT id (untagged column)", "tag",
+     lambda: text("tina", "SELECT id FROM default_catalog.demo.customers ORDER BY id"), [(1,), (2,), (3,)]),
+    ("tina SELECT * orders (tags)", "tag",
+     lambda: text("tina", "SELECT * FROM ice.sales.orders ORDER BY id"), [(1, "us", None), (3, "us", None)]),
     ("mallory CTAS over customers keeps her policy", "-",
      lambda: text("mallory", "SELECT * FROM demo.m_ctas ORDER BY id",
                   ["CREATE TABLE IF NOT EXISTS demo.m_ctas AS SELECT * FROM demo.customers"]), [(1, None, "A")]),

@@ -91,8 +91,13 @@ The local build used JDK 21 with `--release 17`; the official jars are built wit
 
 - `root` is not checked by Ranger (upstream [#72198](https://github.com/StarRocks/starrocks/issues/72198)); it
   is still subject to masks and row filters. Keep its password with the operator.
-- The StarRocks Ranger plugin evaluates resource policies only, no tag policies
-  (upstream [#67458](https://github.com/StarRocks/starrocks/issues/67458)).
+- Tag policies work with no patch (measured, `[tag]` checks): when the policy download carries a
+  `TagEnricher` in the service definition and a `tagPolicies` block, as Ranger Admin serves a service
+  linked to a tag service, the plugin fetches `/service/tags/download/<service>` on its own and applies
+  tag masks, tag row filters and tag denies, through every path. The tag attachments must use the
+  StarRocks resource names (`catalog`, `database`, `table`, `column`). Without the enricher it never
+  requests the tags (upstream [#67458](https://github.com/StarRocks/starrocks/issues/67458) asks for
+  this; PR [#70883](https://github.com/StarRocks/starrocks/pull/70883) documents it).
 - `EXPLAIN COSTS` shows a filtered user the statistics of the whole table (row count, min and max of unmasked
   columns); masked columns show no values.
 - Loads (`BROKER LOAD`, pipes, routine load) that name `aws.s3.use_instance_profile` read with the BE's

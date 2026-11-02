@@ -43,8 +43,9 @@ if [ ! -x "$HERE/.venv/bin/python" ]; then
 fi
 PY=$HERE/.venv/bin/python
 
-"$PY" -I "$HERE/policies.py" "$HERE/servicedef-starrocks.json" "$WORK/policies.json"
-"$PY" -I "$HERE/fakeranger.py" "$WORK/policies.json" "$RANGER_PORT" 2> "$WORK/ranger.log" &
+"$PY" -I "$HERE/policies.py" "$HERE/servicedef-starrocks.json" "$HERE/servicedef-tag.json" "$WORK/policies.json" \
+    "$WORK/tags.json"
+"$PY" -I "$HERE/fakeranger.py" "$WORK/policies.json" "$WORK/tags.json" "$RANGER_PORT" 2> "$WORK/ranger.log" &
 RANGER_PID=$!
 
 docker rm -f "$NAME-sr" "$NAME-rest" "$NAME-s3" >/dev/null 2>&1 || true
@@ -110,6 +111,7 @@ CREATE USER bob IDENTIFIED BY 'bobpw';
 CREATE USER eve IDENTIFIED BY 'evepw';
 CREATE USER svc IDENTIFIED BY 'svcpw';
 CREATE USER mallory IDENTIFIED BY 'mallorypw';
+CREATE USER tina IDENTIFIED BY 'tinapw';
 EOF
 
 echo "waiting for the Ranger plugin to load the policies"
@@ -118,5 +120,16 @@ for _ in $(seq 1 30); do
     sleep 2
 done
 grep -q 'lastKnownVersion=1' "$WORK/ranger.log" || { echo "plugin never loaded policy version 1" >&2; exit 1; }
+# A service whose definition carries a TagEnricher makes the plugin fetch the tags on its own poll.
+echo "waiting for the Ranger plugin to download the tags"
+for _ in $(seq 1 30); do
+    grep -q '/tags/' "$WORK/ranger.log" 2>/dev/null && break
+    sleep 2
+done
+if grep -q '/tags/' "$WORK/ranger.log"; then
+    echo "tag downloads: $(grep -c '/tags/' "$WORK/ranger.log") ($(grep '/tags/' "$WORK/ranger.log" | head -1))"
+else
+    echo "the plugin never requested the tags"
+fi
 
 "$PY" -I "$HERE/checks.py" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT"
