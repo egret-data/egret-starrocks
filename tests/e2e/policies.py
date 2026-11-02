@@ -5,6 +5,9 @@ bob:   SELECT everywhere, MASK_NULL on demo.customers.phone and ice.sales.orders
        row filters id = 1 on demo.customers and region = 'us' on ice.sales.orders.
 eve:   nothing.
 svc:   IMPERSONATE on every user (the way egret's delegator queries as the user).
+mallory: bob's grant, mask and row filter on demo.customers, and she may create and fill tables, views and
+       materialized views in demo: the write paths (CTAS, INSERT ... SELECT, views, materialized views) must
+       not carry data past her policy.
 root:  the orders row filter too. Root is still subject to row filters and masks, and Iceberg metadata
        collect jobs (plan_mode = distributed) read t$logical_iceberg_metadata as root, so this makes the
        "guard" check fail if patch 0001 ever stops exempting those jobs.
@@ -44,12 +47,27 @@ def policy(name, policy_type, resources, **items):
 
 for catalog, db in (("default_catalog", "demo"), ("ice", "sales")):
     policy(f"grant-{catalog}", 0, res(catalog, db, "*", "*"), policyItems=[item(["alice", "bob"])])
+policy("grant-mallory-select", 0, res("default_catalog", "demo", "*", "*"), policyItems=[item(["mallory"])])
+policy("grant-mallory-tables", 0, res("default_catalog", "demo", "*"),
+       policyItems=[item(["mallory"], accesses=[{"type": a, "isAllowed": True}
+                                                for a in ("insert", "drop", "refresh", "alter")])])
+policy("grant-mallory-create", 0, {"catalog": values("default_catalog"), "database": values("demo")},
+       policyItems=[item(["mallory"], accesses=[{"type": a, "isAllowed": True}
+                                                for a in ("create table", "create view",
+                                                          "create materialized view")])])
+policy("grant-mallory-mvs", 0, {"catalog": values("default_catalog"), "database": values("demo"),
+                                "materialized_view": values("*")},
+       policyItems=[item(["mallory"], accesses=[{"type": a, "isAllowed": True}
+                                                for a in ("refresh", "drop", "alter")])])
+policy("grant-mallory-views", 0, {"catalog": values("default_catalog"), "database": values("demo"),
+                                  "view": values("*")},
+       policyItems=[item(["mallory"], accesses=[{"type": "drop", "isAllowed": True}])])
 policy("mask-phone", 1, res("default_catalog", "demo", "customers", "phone"),
-       dataMaskPolicyItems=[item(["bob"], dataMaskInfo={"dataMaskType": "MASK_NULL"})])
+       dataMaskPolicyItems=[item(["bob", "mallory"], dataMaskInfo={"dataMaskType": "MASK_NULL"})])
 policy("mask-email", 1, res("ice", "sales", "orders", "email"),
        dataMaskPolicyItems=[item(["bob"], dataMaskInfo={"dataMaskType": "MASK_NULL"})])
 policy("filter-customers", 2, res("default_catalog", "demo", "customers"),
-       rowFilterPolicyItems=[item(["bob"], rowFilterInfo={"filterExpr": "id = 1"})])
+       rowFilterPolicyItems=[item(["bob", "mallory"], rowFilterInfo={"filterExpr": "id = 1"})])
 policy("filter-orders", 2, res("ice", "sales", "orders"),
        rowFilterPolicyItems=[item(["bob", "root"], rowFilterInfo={"filterExpr": "region = 'us'"})])
 policy("impersonate", 0, {"user": values("*")},

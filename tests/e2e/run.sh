@@ -9,6 +9,11 @@ set -euo pipefail
 IMAGE=${1:?usage: run.sh <allin1-image>}
 HERE=$(cd "$(dirname "$0")" && pwd)
 SR_PORT=${SR_PORT:-19130}
+SR_HTTP_PORT=${SR_HTTP_PORT:-19131}
+# Arrow Flight SQL: the FE returns the BE's own address (127.0.0.1:<port>) for fetching results, so both
+# ports are published on the same number.
+FE_FLIGHT_PORT=19408
+BE_FLIGHT_PORT=19419
 S3_PORT=${S3_PORT:-19100}
 RANGER_PORT=18777
 NAME=egs-e2e
@@ -17,6 +22,7 @@ NET=$NAME-net
 REST_IMAGE=apache/iceberg-rest-fixture:1.10.1
 S3_IMAGE=rustfs/rustfs:1.0.1
 FE_CONF=/data/deploy/starrocks/fe/conf
+BE_CONF=/data/deploy/starrocks/be/conf
 RANGER_PID=
 
 cleanup() {
@@ -54,10 +60,15 @@ docker run -d --name "$NAME-rest" --network "$NET" --network-alias iceberg-rest 
     "$REST_IMAGE" >/dev/null
 
 docker run --rm --entrypoint cat "$IMAGE" "$FE_CONF/fe.conf" > "$WORK/fe.conf"
-printf '\naccess_control = ranger\n' >> "$WORK/fe.conf"
-docker run -d --name "$NAME-sr" --network "$NET" -p "$SR_PORT:9030" \
+printf '\naccess_control = ranger\narrow_flight_port = %s\n' "$FE_FLIGHT_PORT" >> "$WORK/fe.conf"
+# Arrow needs java.nio opened; the official fe.conf does not, so Flight SQL fails without it.
+sed -i.bak 's#^JAVA_OPTS="#JAVA_OPTS="--add-opens=java.base/java.nio=ALL-UNNAMED #' "$WORK/fe.conf"
+docker run --rm --entrypoint cat "$IMAGE" "$BE_CONF/be.conf" > "$WORK/be.conf"
+printf '\narrow_flight_port = %s\n' "$BE_FLIGHT_PORT" >> "$WORK/be.conf"
+docker run -d --name "$NAME-sr" --network "$NET" -p "$SR_PORT:9030" -p "$SR_HTTP_PORT:8030" \
+    -p "$FE_FLIGHT_PORT:$FE_FLIGHT_PORT" -p "$BE_FLIGHT_PORT:$BE_FLIGHT_PORT" \
     --add-host host.docker.internal:host-gateway \
-    -v "$WORK/fe.conf:$FE_CONF/fe.conf" \
+    -v "$WORK/fe.conf:$FE_CONF/fe.conf" -v "$WORK/be.conf:$BE_CONF/be.conf" \
     -v "$HERE/ranger-starrocks-security.xml:$FE_CONF/ranger-starrocks-security.xml:ro" \
     -v "$HERE/ranger-starrocks-audit.xml:$FE_CONF/ranger-starrocks-audit.xml:ro" \
     "$IMAGE" >/dev/null
@@ -98,6 +109,7 @@ CREATE USER alice IDENTIFIED BY 'alicepw';
 CREATE USER bob IDENTIFIED BY 'bobpw';
 CREATE USER eve IDENTIFIED BY 'evepw';
 CREATE USER svc IDENTIFIED BY 'svcpw';
+CREATE USER mallory IDENTIFIED BY 'mallorypw';
 EOF
 
 echo "waiting for the Ranger plugin to load the policies"
@@ -107,4 +119,4 @@ for _ in $(seq 1 30); do
 done
 grep -q 'lastKnownVersion=1' "$WORK/ranger.log" || { echo "plugin never loaded policy version 1" >&2; exit 1; }
 
-"$PY" -I "$HERE/checks.py" "$SR_PORT"
+"$PY" -I "$HERE/checks.py" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT"

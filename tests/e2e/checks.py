@@ -1,16 +1,23 @@
-"""Security checks against a running StarRocks: checks.py <port>.
+"""Security checks against a running StarRocks: checks.py <mysql port> <http port> <flight sql port>.
 
 Every check reads through one path as one user and compares the result with what the policies in
 policies.py allow. Exit code 1 when any check fails. The `patch` column names the fork patch a check
 covers ("-" for a control that must hold on the official image too, "guard" for a check that a
 patch must not break).
 """
+import base64
+import json
 import sys
+import urllib.error
+import urllib.request
 
+import adbc_driver_flightsql.dbapi as flight_sql
 import mysql.connector
 
 PORT = int(sys.argv[1])
-PASSWORDS = {"alice": "alicepw", "bob": "bobpw", "eve": "evepw", "svc": "svcpw"}
+HTTP_PORT = int(sys.argv[2])
+FLIGHT_PORT = int(sys.argv[3])
+PASSWORDS = {"root": "", "alice": "alicepw", "bob": "bobpw", "eve": "evepw", "svc": "svcpw", "mallory": "mallorypw"}
 DENIED = "DENIED"
 
 CUSTOMERS_ALL = [(1, "010-1111-2222"), (2, "010-3333-4444"), (3, "010-5555-6666")]
@@ -38,7 +45,7 @@ def run(fn):
     try:
         return fn()
     except mysql.connector.Error as e:
-        if e.errno in (5203, 5204, 5210) or "Access denied" in str(e):
+        if e.errno in (5203, 5204, 5210, 5211, 5212) or "Access denied" in str(e):
             return DENIED
         return f"ERROR {e.errno}: {e.msg}"
     except Exception as e:  # a broken check must report, not stop the run
@@ -76,6 +83,47 @@ def binary(user, sql_template, execute_as=None):
         cur.execute(sql_template.format(p="CAST(%s AS BIGINT)"), ("0",))
         return norm(cur.fetchall())
     return run(go)
+
+
+def http(user, catalog, db, sql):
+    """The FE's HTTP SQL API (POST /api/v1/catalogs/<catalog>/databases/<db>/sql, newline-delimited JSON)."""
+    def go():
+        auth = base64.b64encode(f"{user}:{PASSWORDS[user]}".encode()).decode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{HTTP_PORT}/api/v1/catalogs/{catalog}/databases/{db}/sql",
+            data=json.dumps({"query": sql + ";"}).encode(), method="POST",
+            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            lines = [json.loads(line) for line in resp.read().decode().splitlines() if line.strip()]
+        for line in lines:
+            if line.get("status") == "FAILED":
+                msg = line.get("msg", "")
+                return DENIED if "Access denied" in msg else f"ERROR {msg}"
+        return [tuple(line["data"]) for line in lines if "data" in line]
+    return run(go)
+
+
+def flight(user, sql):
+    """Arrow Flight SQL (the FE's arrow_flight_port)."""
+    def go():
+        try:
+            with flight_sql.connect(f"grpc://127.0.0.1:{FLIGHT_PORT}",
+                                    db_kwargs={"username": user, "password": PASSWORDS[user]}) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                    return norm(cur.fetchall())
+        except Exception as e:  # ADBC raises its own error types
+            return DENIED if "Access denied" in str(e) else f"ERROR {type(e).__name__}: {str(e)[:200]}"
+    return run(go)
+
+
+S3 = ('"aws.s3.endpoint" = "http://s3:9000", "aws.s3.access_key" = "e2e", "aws.s3.secret_key" = "e2esecret", '
+      '"aws.s3.enable_path_style_access" = "true", "aws.s3.region" = "us-east-1"')
+FILES_ORDERS = f'FILES("path" = "s3://warehouse/sales/orders/data/*", "format" = "parquet", {S3})'
+PIVOT_REGION = ("SELECT * FROM (SELECT id, region FROM ice.sales.orders) t "
+                "PIVOT (count(id) FOR region IN ('us' AS us, 'eu' AS eu))")
+PIVOT_EMAIL = ("SELECT * FROM (SELECT id, email FROM ice.sales.orders) t "
+               "PIVOT (max(email) FOR id IN (1 AS a, 2 AS b))")
 
 
 def nonempty(result):
@@ -118,6 +166,39 @@ CHECKS = [
     ("bob SELECT _file, _pos orders (filter)", "guard",
      lambda: text("bob", "SELECT id, _pos FROM ice.sales.orders WHERE _file IS NOT NULL ORDER BY id"),
      lambda r: isinstance(r, list) and [row[0] for row in r] == [1, 3]),
+    ("bob WITH x AS (SELECT * orders)", "0003",
+     lambda: text("bob", "WITH x AS (SELECT * FROM ice.sales.orders) SELECT * FROM x ORDER BY id"), ORDERS_BOB),
+    # PIVOT: the rewrite must reach the relation under a pivot.
+    ("alice PIVOT orders by region", "-", lambda: text("alice", PIVOT_REGION), [(2, 2)]),
+    ("bob PIVOT orders by region (filter)", "0002", lambda: text("bob", PIVOT_REGION), [(2, 0)]),
+    ("bob PIVOT orders email (mask+filter)", "0002", lambda: text("bob", PIVOT_EMAIL), [(None, None)]),
+    # The FE's HTTP SQL API and Arrow Flight SQL run user SQL outside the MySQL protocol.
+    ("alice HTTP SQL orders", "-",
+     lambda: http("alice", "ice", "sales", "SELECT id, region, email FROM orders ORDER BY id"), ORDERS_ALL),
+    ("bob HTTP SQL orders (mask+filter)", "0004",
+     lambda: http("bob", "ice", "sales", "SELECT id, region, email FROM orders ORDER BY id"), ORDERS_BOB),
+    ("alice Flight SQL orders", "-", lambda: flight("alice", ORDERS_SQL.format(p=0)), ORDERS_ALL),
+    ("bob Flight SQL orders (mask+filter)", "0004", lambda: flight("bob", ORDERS_SQL.format(p=0)), ORDERS_BOB),
+    # SHOW CREATE CATALOG prints a catalog's endpoints and the ends of its keys.
+    ("eve SHOW CREATE CATALOG ice", "0005", lambda: text("eve", "SHOW CREATE CATALOG ice"), DENIED),
+    ("bob SHOW CREATE CATALOG ice (has grants in it)", "guard",
+     lambda: text("bob", "SHOW CREATE CATALOG ice"), nonempty),
+    # FILES() reads object storage with no table privilege, mask or row filter.
+    ("eve FILES() on orders' data files", "0006",
+     lambda: text("eve", f"SELECT * FROM {FILES_ORDERS}"), DENIED),
+    ("bob FILES() on orders' data files", "0006",
+     lambda: text("bob", f"SELECT * FROM {FILES_ORDERS}"), DENIED),
+    ("root FILES() (OPERATE on SYSTEM)", "guard",
+     lambda: text("root", f"SELECT count(*) FROM {FILES_ORDERS}"), [(4,)]),
+    # Write paths of a user under a mask and a row filter (mallory, on demo.customers).
+    ("mallory CTAS over customers keeps her policy", "-",
+     lambda: text("mallory", "SELECT * FROM demo.m_ctas ORDER BY id",
+                  ["CREATE TABLE IF NOT EXISTS demo.m_ctas AS SELECT * FROM demo.customers"]), [(1, None, "A")]),
+    # A materialized view's refresh reads the base table without her policy and stores every row in the clear.
+    ("mallory CREATE MATERIALIZED VIEW over customers", "0007",
+     lambda: text("mallory", "CREATE MATERIALIZED VIEW demo.m_mv DISTRIBUTED BY HASH(id) REFRESH MANUAL "
+                             "PROPERTIES ('replication_num' = '1') AS SELECT id, phone FROM demo.customers"),
+     DENIED),
 ]
 
 
