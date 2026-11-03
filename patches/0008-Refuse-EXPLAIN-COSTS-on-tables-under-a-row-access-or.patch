@@ -1,4 +1,4 @@
-From 8222c84973d5518dd18c0af0023cc7322e6e65af Mon Sep 17 00:00:00 2001
+From 14e1107fb598aae8b7fc134ec17070b6c2fc900b Mon Sep 17 00:00:00 2001
 From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
 Date: Tue, 3 Nov 2026 10:12:24 +0700
 Subject: [PATCH 8/9] Refuse EXPLAIN COSTS on tables under a row access or

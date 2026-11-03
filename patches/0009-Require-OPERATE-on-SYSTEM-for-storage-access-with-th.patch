@@ -1,4 +1,4 @@
-From 1fd8e94e8dada00900096b9d9c84d894e52c4b81 Mon Sep 17 00:00:00 2001
+From 3662f410d0874501e03a1b6f9623da8c6863d7fe Mon Sep 17 00:00:00 2001
 From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
 Date: Tue, 3 Nov 2026 10:12:24 +0700
 Subject: [PATCH 9/9] Require OPERATE on SYSTEM for storage access with the
@@ -480,7 +480,7 @@ index 00000000000..5ddd6efb20b
 +    }
 +}
 diff --git a/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java b/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
-index ae1536bf4b1..8c11ddebebd 100644
+index b716ea3459e..8841205297b 100644
 --- a/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
 +++ b/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
 @@ -2308,11 +2308,12 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {

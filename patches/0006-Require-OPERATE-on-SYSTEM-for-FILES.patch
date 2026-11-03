@@ -1,7 +1,7 @@
-From 72cfffaa81aa23d2314d8c6ea3561d62ec6f7f83 Mon Sep 17 00:00:00 2001
+From d1004e8c257440d269dc02754539417e67126652 Mon Sep 17 00:00:00 2001
 From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
 Date: Mon, 2 Nov 2026 19:54:10 +0700
-Subject: [PATCH 6/7] Require OPERATE on SYSTEM for FILES()
+Subject: [PATCH 6/9] Require OPERATE on SYSTEM for FILES()
 
 FILES() had no privilege of its own (upstream #79980, #80233): any user who
 could log in read and wrote object storage through it, with no table
@@ -19,8 +19,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../starrocks/sql/analyzer/QueryAnalyzer.java |  2 +
  .../sql/analyzer/ShowStmtAnalyzer.java        |  2 +
  .../FilesFunctionPrivilegeTest.java           | 97 +++++++++++++++++++
+ .../sql/analyzer/PrivilegeCheckerTest.java    |  7 ++
  .../java/com/starrocks/common/ErrorCode.java  |  3 +
- 6 files changed, 149 insertions(+)
+ 7 files changed, 156 insertions(+)
  create mode 100644 fe/fe-core/src/main/java/com/starrocks/authorization/FilesFunctionPrivilege.java
  create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/FilesFunctionPrivilegeTest.java
 
@@ -236,6 +237,31 @@ index 00000000000..b21cf656421
 +        Assertions.assertFalse(refusedForFiles(t), String.valueOf(t));
 +    }
 +}
+diff --git a/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java b/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
+index ae1536bf4b1..b716ea3459e 100644
+--- a/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
++++ b/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
+@@ -3605,6 +3605,12 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
+             ShowResultSet res =
+                     ShowExecutor.execute((ShowStmt) UtFrameUtils.parseStmtWithNewParser("show pipes", ctx), ctx);
+             Assertions.assertEquals(0, res.getResultRows().size());
++            // A pipe loads through FILES(), which needs OPERATE on SYSTEM (FilesFunctionPrivilege); the user has it
++            // until the pipes below are created.
++            Exception filesRefused = Assertions.assertThrows(Exception.class,
++                    () -> DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(createSql, ctx), ctx));
++            Assertions.assertTrue(filesRefused.getMessage().contains("FILES()"), filesRefused.getMessage());
++            grantRevokeSqlAsRoot("grant operate on system to test");
+             // create
+             DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(createSql, ctx), ctx);
+             // show
+@@ -3654,6 +3660,7 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
+         //        ctxToRoot();
+         DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(createSql, ctx), ctx);
+         DDLStmtExecutor.execute(UtFrameUtils.parseStmtWithNewParser(createSql2, ctx), ctx);
++        grantRevokeSqlAsRoot("revoke operate on system from test");
+ 
+         // test show pipes
+         ShowResultSet res =
 diff --git a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
 index d35759ef4a0..c537304de03 100644
 --- a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
