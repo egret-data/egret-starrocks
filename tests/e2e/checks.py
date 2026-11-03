@@ -8,6 +8,7 @@ patch must not break).
 import base64
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -45,7 +46,7 @@ def run(fn):
     try:
         return fn()
     except mysql.connector.Error as e:
-        if e.errno in (5203, 5204, 5210, 5211, 5212) or "Access denied" in str(e):
+        if e.errno in (5203, 5204, 5210, 5211, 5212, 5213, 5214) or "Access denied" in str(e):
             return DENIED
         return f"ERROR {e.errno}: {e.msg}"
     except Exception as e:  # a broken check must report, not stop the run
@@ -130,6 +131,30 @@ def nonempty(result):
     return isinstance(result, list) and len(result) > 0
 
 
+def not_refused(result):
+    """The statement got past every privilege check (it may still fail later, on the storage)."""
+    return result != DENIED and not str(result).startswith("ERROR 52")
+
+
+# Storage properties with no credentials of the statement's own: the FE and BE fall back to the cluster's
+# identity (here RustFS refuses it; on a cloud node it is the node's role).
+S3_NO_KEYS = ('"aws.s3.endpoint" = "http://s3:9000", "aws.s3.enable_path_style_access" = "true", '
+              '"aws.s3.region" = "us-east-1"')
+S3_PROFILE = S3_NO_KEYS + ', "aws.s3.use_instance_profile" = "true"'
+RUN_ID = int(time.time())
+M_LOAD_TABLE = ("CREATE TABLE IF NOT EXISTS demo.m_load (id BIGINT, region VARCHAR(16), email VARCHAR(64)) "
+                "DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num' = '1')")
+
+
+def outfile(props, name):
+    return f"SELECT 1 INTO OUTFILE 's3://warehouse/probe/{name}_{RUN_ID}_' FORMAT AS CSV PROPERTIES ({props})"
+
+
+def broker_load(props, name):
+    return (f"LOAD LABEL demo.{name}_{RUN_ID} (DATA INFILE('s3://warehouse/sales/orders/data/*') "
+            f"INTO TABLE m_load FORMAT AS 'parquet') WITH BROKER ({props})")
+
+
 CHECKS = [
     # name, patch, actual (thunk), expected value or predicate
     ("alice text customers", "-", lambda: text("alice", CUSTOMERS_SQL.format(p=0)), CUSTOMERS_ALL),
@@ -190,6 +215,29 @@ CHECKS = [
      lambda: text("bob", f"SELECT * FROM {FILES_ORDERS}"), DENIED),
     ("root FILES() (OPERATE on SYSTEM)", "guard",
      lambda: text("root", f"SELECT count(*) FROM {FILES_ORDERS}"), [(4,)]),
+    # EXPLAIN COSTS prints the whole table's column statistics (min, max, NDV), which a row filter does not narrow.
+    ("bob EXPLAIN COSTS orders (filtered)", "0008",
+     lambda: text("bob", "EXPLAIN COSTS SELECT id, region FROM ice.sales.orders"), DENIED),
+    ("bob EXPLAIN COSTS customers (masked, filtered)", "0008",
+     lambda: text("bob", "EXPLAIN COSTS SELECT id FROM default_catalog.demo.customers"), DENIED),
+    ("bob EXPLAIN orders", "guard",
+     lambda: text("bob", "EXPLAIN SELECT id, region FROM ice.sales.orders"), nonempty),
+    ("alice EXPLAIN COSTS orders (no policy)", "guard",
+     lambda: text("alice", "EXPLAIN COSTS SELECT id, region FROM ice.sales.orders"), nonempty),
+    # Storage named without the statement's own credentials runs with the cluster's identity.
+    ("eve INTO OUTFILE, no keys", "0009", lambda: text("eve", outfile(S3_NO_KEYS, "eve_nokey")), DENIED),
+    ("eve INTO OUTFILE, instance profile", "0009", lambda: text("eve", outfile(S3_PROFILE, "eve_profile")), DENIED),
+    ("eve INTO OUTFILE, own keys", "guard", lambda: text("eve", outfile(S3, "eve_keys")), not_refused),
+    ("mallory BROKER LOAD, no keys", "0009",
+     lambda: text("mallory", broker_load(S3_NO_KEYS, "m_nokey"), [M_LOAD_TABLE]), DENIED),
+    ("mallory BROKER LOAD, own keys", "guard",
+     lambda: text("mallory", broker_load(S3, "m_keys"), [M_LOAD_TABLE]), not_refused),
+    ("mallory FILE external table, no keys", "0009",
+     lambda: text("mallory", "CREATE EXTERNAL TABLE demo.m_ft (id BIGINT) ENGINE = file PROPERTIES "
+                             f"('path' = 's3://warehouse/sales/orders/data/', 'format' = 'parquet', "
+                             f"{S3_NO_KEYS.replace(chr(34), chr(39))})"), DENIED),
+    ("root BROKER LOAD, no keys (OPERATE on SYSTEM)", "guard",
+     lambda: text("root", broker_load(S3_NO_KEYS, "r_nokey")), not_refused),
     # Write paths of a user under a mask and a row filter (mallory, on demo.customers).
     # Tag policies: tina's mask, row filter and deny come only from tags (policies.py).
     ("tina text customers (tag PII mask)", "tag",

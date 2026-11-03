@@ -1,0 +1,531 @@
+From 1fd8e94e8dada00900096b9d9c84d894e52c4b81 Mon Sep 17 00:00:00 2001
+From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
+Date: Tue, 3 Nov 2026 10:12:24 +0700
+Subject: [PATCH 9/9] Require OPERATE on SYSTEM for storage access with the
+ cluster's identity
+
+BROKER LOAD, EXPORT, SELECT ... INTO OUTFILE and CREATE EXTERNAL TABLE ...
+ENGINE = file accepted storage properties with no credentials of their own
+and then ran with the cluster's identity: an instance profile, the AWS
+default credential chain (which the S3 client uses whenever no keys are
+given), a web identity token, an Azure managed identity, a GCE service
+account, a keytab on the server or the keys in be.conf. Measured on 4.1.7:
+a user with no privilege reached the object store through INTO OUTFILE,
+and a BROKER LOAD with no keys made the FE try the environment's
+credential providers.
+
+These statements now need OPERATE on SYSTEM (error 5214) unless every
+location is on an object store and the properties carry that store's own
+credentials and turn on no cluster-identity switch; the switches take
+precedence over keys. HDFS and local paths always need it.
+
+PrivilegeCheckerTest's load and export cases, which test table privileges,
+now name their own keys.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ServerStorageIdentityCheck.java           | 156 +++++++++++++++
+ .../sql/analyzer/AuthorizerStmtVisitor.java   |  23 +++
+ .../com/starrocks/sql/ast/OutFileClause.java  |   4 +
+ .../ServerStorageIdentityCheckTest.java       | 183 ++++++++++++++++++
+ .../sql/analyzer/PrivilegeCheckerTest.java    |  10 +-
+ .../java/com/starrocks/common/ErrorCode.java  |   4 +
+ 6 files changed, 376 insertions(+), 4 deletions(-)
+ create mode 100644 fe/fe-core/src/main/java/com/starrocks/authorization/ServerStorageIdentityCheck.java
+ create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/ServerStorageIdentityCheckTest.java
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/authorization/ServerStorageIdentityCheck.java b/fe/fe-core/src/main/java/com/starrocks/authorization/ServerStorageIdentityCheck.java
+new file mode 100644
+index 00000000000..3208c8099ef
+--- /dev/null
++++ b/fe/fe-core/src/main/java/com/starrocks/authorization/ServerStorageIdentityCheck.java
+@@ -0,0 +1,156 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.Authorizer;
++
++import java.net.URI;
++import java.util.Collection;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++
++/**
++ * BROKER LOAD, EXPORT, SELECT ... INTO OUTFILE and a FILE external table read or write a storage location the
++ * user names, with storage properties the user writes. When those properties carry no credentials of the user's
++ * own, the FE and BE do not refuse: they fall back to the cluster's identity. An instance profile, the AWS
++ * default credential chain (the legacy S3 client uses it whenever no keys are given), a web identity token, an
++ * Azure managed identity, a GCE service account, a keytab on the server or the keys in be.conf. That identity
++ * usually reaches the data files of every table, so such a statement needs the OPERATE privilege on SYSTEM.
++ *
++ * <p>A statement passes without OPERATE only when every location is on an object store and the properties
++ * name that store's own credentials (an access key pair, a shared key, a SAS token, a client secret, a service
++ * account key) and turn on none of the cluster-identity switches, which take precedence over keys. Anything
++ * else, HDFS and local paths included, is treated as the cluster's identity.
++ */
++public final class ServerStorageIdentityCheck {
++    private ServerStorageIdentityCheck() {
++    }
++
++    /** Switches that make the FE or BE use its own identity, whatever keys are also given. */
++    private static final List<String> SERVER_IDENTITY_SWITCHES = List.of(
++            "aws.s3.use_aws_sdk_default_behavior",
++            "aws.s3.use_instance_profile",
++            "aws.s3.use_web_identity_token_file",
++            "azure.blob.oauth2_use_managed_identity",
++            "azure.adls1.use_managed_service_identity",
++            "azure.adls2.oauth2_use_managed_identity",
++            "gcp.gcs.use_compute_engine_service_account");
++
++    /** Properties that point at a credential file on the server. */
++    private static final List<String> SERVER_CREDENTIAL_FILES = List.of(
++            "azure.adls2.oauth2_token_file",
++            "kerberos_keytab",
++            "hadoop.kerberos.keytab");
++
++    private static final Set<String> S3_SCHEMES = Set.of("s3", "s3a", "s3n", "obs", "ks3", "tos");
++
++    public static void check(ConnectContext context, String statementKind, Collection<String> paths,
++                             Map<String, String> properties) {
++        if (context == null || context.getCurrentUserIdentity() == null) {
++            return;
++        }
++        if (!usesServerIdentity(paths, properties)) {
++            return;
++        }
++        try {
++            Authorizer.checkSystemAction(context, PrivilegeType.OPERATE);
++        } catch (AccessDeniedException e) {
++            throw ErrorReportException.report(ErrorCode.ERR_ACCESS_DENIED_SERVER_STORAGE_IDENTITY, statementKind);
++        }
++    }
++
++    public static boolean usesServerIdentity(Collection<String> paths, Map<String, String> properties) {
++        Map<String, String> props = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
++        if (properties != null) {
++            props.putAll(properties);
++        }
++        for (String key : SERVER_IDENTITY_SWITCHES) {
++            if (Boolean.parseBoolean(props.getOrDefault(key, "false").trim())) {
++                return true;
++            }
++        }
++        for (String key : SERVER_CREDENTIAL_FILES) {
++            if (present(props, key)) {
++                return true;
++            }
++        }
++        if (paths == null || paths.isEmpty()) {
++            return true;
++        }
++        for (String path : paths) {
++            if (!hasOwnCredentials(scheme(path), props)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private static boolean hasOwnCredentials(String scheme, Map<String, String> props) {
++        if (scheme == null) {
++            return false;
++        }
++        if (S3_SCHEMES.contains(scheme)) {
++            return present(props, "aws.s3.access_key") && present(props, "aws.s3.secret_key");
++        }
++        switch (scheme) {
++            case "oss":
++                return present(props, "aliyun.oss.access_key") && present(props, "aliyun.oss.secret_key");
++            case "cos":
++            case "cosn":
++                return present(props, "tencent.cos.access_key") && present(props, "tencent.cos.secret_key");
++            case "gs":
++                return present(props, "gcp.gcs.service_account_private_key") &&
++                        present(props, "gcp.gcs.service_account_private_key_id") &&
++                        present(props, "gcp.gcs.service_account_email");
++            case "wasb":
++            case "wasbs":
++                return present(props, "azure.blob.shared_key") || present(props, "azure.blob.sas_token") ||
++                        present(props, "azure.blob.oauth2_client_secret");
++            case "abfs":
++            case "abfss":
++                return present(props, "azure.adls2.shared_key") || present(props, "azure.adls2.sas_token") ||
++                        present(props, "azure.adls2.oauth2_client_secret");
++            case "adl":
++                return present(props, "azure.adls1.oauth2_credential");
++            default:
++                // hdfs://, viewfs://, file:// and anything else: the cluster's own access.
++                return false;
++        }
++    }
++
++    private static boolean present(Map<String, String> props, String key) {
++        String value = props.get(key);
++        return value != null && !value.trim().isEmpty();
++    }
++
++    private static String scheme(String path) {
++        if (path == null) {
++            return null;
++        }
++        try {
++            String scheme = new URI(path.trim()).getScheme();
++            return scheme == null ? null : scheme.toLowerCase(Locale.ROOT);
++        } catch (Exception e) {
++            int colon = path.indexOf("://");
++            return colon > 0 ? path.substring(0, colon).trim().toLowerCase(Locale.ROOT) : null;
++        }
++    }
++}
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
+index 75e8fbab952..6f8ddd751b3 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
+@@ -24,10 +24,12 @@ import com.starrocks.authorization.ObjectType;
+ import com.starrocks.authorization.PrivilegeBuiltinConstants;
+ import com.starrocks.authorization.PrivilegeException;
+ import com.starrocks.authorization.PrivilegeType;
++import com.starrocks.authorization.ServerStorageIdentityCheck;
+ import com.starrocks.backup.AbstractJob;
+ import com.starrocks.backup.BackupJob;
+ import com.starrocks.catalog.BasicTable;
+ import com.starrocks.catalog.Database;
++import com.starrocks.catalog.FileTable;
+ import com.starrocks.catalog.Function;
+ import com.starrocks.catalog.FunctionName;
+ import com.starrocks.catalog.FunctionSearchDesc;
+@@ -256,12 +258,14 @@ import com.starrocks.sql.ast.warehouse.cngroup.AlterCnGroupStmt;
+ import com.starrocks.sql.ast.warehouse.cngroup.CreateCnGroupStmt;
+ import com.starrocks.sql.ast.warehouse.cngroup.DropCnGroupStmt;
+ import com.starrocks.sql.ast.warehouse.cngroup.EnableDisableCnGroupStmt;
++import com.starrocks.sql.common.EngineType;
+ import com.starrocks.sql.common.MetaUtils;
+ import com.starrocks.sql.parser.NodePosition;
+ import org.apache.commons.collections4.CollectionUtils;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ 
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -290,6 +294,11 @@ public class AuthorizerStmtVisitor implements AstVisitorExtendInterface<Void, Co
+     @Override
+     public Void visitQueryStatement(QueryStatement statement, ConnectContext context) {
+         checkSelectTableAction(context, statement, Lists.newArrayList());
++        if (statement.hasOutFileClause() && statement.getOutFileClause().getBrokerDesc() != null) {
++            ServerStorageIdentityCheck.check(context, "SELECT INTO OUTFILE",
++                    List.of(statement.getOutFileClause().getFilePath()),
++                    statement.getOutFileClause().getBrokerDesc().getProperties());
++        }
+ 
+         List<HintNode> hintNodes = null;
+         if (statement.getQueryRelation() instanceof SelectRelation) {
+@@ -514,6 +523,11 @@ public class AuthorizerStmtVisitor implements AstVisitorExtendInterface<Void, Co
+ 
+     @Override
+     public Void visitLoadStatement(LoadStmt statement, ConnectContext context) {
++        if (statement.getBrokerDesc() != null) {
++            List<String> paths = new ArrayList<>();
++            statement.getDataDescriptions().forEach(d -> paths.addAll(d.getFilePaths()));
++            ServerStorageIdentityCheck.check(context, "BROKER LOAD", paths, statement.getBrokerDesc().getProperties());
++        }
+         // check resource privilege
+         if (null != statement.getResourceDesc()) {
+             String resourceName = statement.getResourceDesc().getName();
+@@ -1785,6 +1799,12 @@ public class AuthorizerStmtVisitor implements AstVisitorExtendInterface<Void, Co
+ 
+     @Override
+     public Void visitCreateTableStatement(CreateTableStmt statement, ConnectContext context) {
++        if (EngineType.FILE.name().equalsIgnoreCase(statement.getEngineName())) {
++            Map<String, String> fileProperties = statement.getProperties();
++            String path = fileProperties == null ? null : fileProperties.get(FileTable.JSON_KEY_FILE_PATH);
++            ServerStorageIdentityCheck.check(context, "a FILE external table",
++                    path == null ? List.of() : List.of(path), fileProperties);
++        }
+         String catalog = statement.getCatalogName();
+         if (catalog == null) {
+             catalog = context.getCurrentCatalog();
+@@ -2477,6 +2497,9 @@ public class AuthorizerStmtVisitor implements AstVisitorExtendInterface<Void, Co
+                     context.getCurrentUserIdentity(), context.getCurrentRoleIds(),
+                     PrivilegeType.EXPORT.name(), ObjectType.TABLE.name(), statement.getTableName());
+         }
++        ServerStorageIdentityCheck.check(context, "EXPORT",
++                statement.getPath() == null ? List.of() : List.of(statement.getPath()),
++                statement.getBrokerDesc() == null ? Map.of() : statement.getBrokerDesc().getProperties());
+         return null;
+     }
+ 
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/ast/OutFileClause.java b/fe/fe-core/src/main/java/com/starrocks/sql/ast/OutFileClause.java
+index b87af5915c3..cb3037039e9 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/ast/OutFileClause.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/ast/OutFileClause.java
+@@ -187,6 +187,10 @@ public class OutFileClause implements ParseNode {
+         return maxFileSizeBytes;
+     }
+ 
++    public String getFilePath() {
++        return filePath;
++    }
++
+     public BrokerDesc getBrokerDesc() {
+         return brokerDesc;
+     }
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/ServerStorageIdentityCheckTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/ServerStorageIdentityCheckTest.java
+new file mode 100644
+index 00000000000..5ddd6efb20b
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/ServerStorageIdentityCheckTest.java
+@@ -0,0 +1,183 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.Analyzer;
++import com.starrocks.sql.analyzer.Authorizer;
++import com.starrocks.sql.ast.QueryStatement;
++import com.starrocks.sql.ast.StatementBase;
++import com.starrocks.sql.parser.SqlParser;
++import com.starrocks.utframe.StarRocksAssert;
++import com.starrocks.utframe.UtFrameUtils;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++
++import java.util.List;
++import java.util.Map;
++
++/**
++ * A statement that names a storage location without credentials of the user's own runs with the cluster's
++ * identity, so it needs the OPERATE privilege on SYSTEM.
++ */
++public class ServerStorageIdentityCheckTest {
++    private static final String KEYS = "'aws.s3.access_key' = 'ak', 'aws.s3.secret_key' = 'sk', " +
++            "'aws.s3.region' = 'us-east-1'";
++    private static final String NO_KEYS = "'aws.s3.region' = 'us-east-1'";
++    private static final String PROFILE = KEYS + ", 'aws.s3.use_instance_profile' = 'true'";
++    private static ConnectContext connectContext;
++
++    @BeforeAll
++    public static void beforeClass() throws Exception {
++        UtFrameUtils.createMinStarRocksCluster();
++        connectContext = UtFrameUtils.createDefaultCtx();
++        new StarRocksAssert(connectContext).withDatabase("db_ssi").useDatabase("db_ssi")
++                .withTable("CREATE TABLE t (id BIGINT) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 " +
++                        "PROPERTIES ('replication_num' = '1')");
++    }
++
++    // ------------------------------------------------ the rule ------------------------------------------------
++
++    private static boolean server(String path, Map<String, String> props) {
++        return ServerStorageIdentityCheck.usesServerIdentity(List.of(path), props);
++    }
++
++    @Test
++    public void anAccessKeyPairForTheStoreIsTheUsersOwn() {
++        Assertions.assertFalse(server("s3://b/p", Map.of("aws.s3.access_key", "ak", "aws.s3.secret_key", "sk")));
++        Assertions.assertFalse(server("S3A://b/p", Map.of("AWS.S3.ACCESS_KEY", "ak", "aws.s3.secret_key", "sk")));
++        Assertions.assertFalse(server("oss://b/p", Map.of("aliyun.oss.access_key", "ak", "aliyun.oss.secret_key", "sk")));
++        Assertions.assertFalse(server("abfss://c@a.dfs.core.windows.net/p", Map.of("azure.adls2.sas_token", "t")));
++        Assertions.assertFalse(server("gs://b/p", Map.of("gcp.gcs.service_account_private_key", "k",
++                "gcp.gcs.service_account_private_key_id", "i", "gcp.gcs.service_account_email", "e")));
++    }
++
++    @Test
++    public void noKeysFallsBackToTheCluster() {
++        Assertions.assertTrue(server("s3://b/p", Map.of()));
++        Assertions.assertTrue(server("s3://b/p", Map.of("aws.s3.access_key", "ak")));
++        Assertions.assertTrue(server("s3://b/p", Map.of("aws.s3.access_key", "ak", "aws.s3.secret_key", " ")));
++        Assertions.assertTrue(server("s3://b/p", Map.of("aws.s3.iam_role_arn", "arn:aws:iam::1:role/r")));
++        Assertions.assertTrue(ServerStorageIdentityCheck.usesServerIdentity(List.of(), Map.of()));
++        Assertions.assertTrue(ServerStorageIdentityCheck.usesServerIdentity(null, null));
++    }
++
++    @Test
++    public void aClusterIdentitySwitchWinsOverKeys() {
++        for (String flag : List.of("aws.s3.use_instance_profile", "aws.s3.use_aws_sdk_default_behavior",
++                "aws.s3.use_web_identity_token_file")) {
++            Assertions.assertTrue(server("s3://b/p", Map.of("aws.s3.access_key", "ak", "aws.s3.secret_key", "sk",
++                    flag, "TRUE")), flag);
++        }
++        Assertions.assertTrue(server("abfs://c@a.dfs.core.windows.net/p", Map.of("azure.adls2.sas_token", "t",
++                "azure.adls2.oauth2_use_managed_identity", "true")));
++        Assertions.assertTrue(server("s3://b/p", Map.of("aws.s3.access_key", "ak", "aws.s3.secret_key", "sk",
++                "hadoop.kerberos.keytab", "/etc/krb5.keytab")));
++    }
++
++    @Test
++    public void keysForAnotherStoreDoNotCount() {
++        Map<String, String> awsKeys = Map.of("aws.s3.access_key", "ak", "aws.s3.secret_key", "sk");
++        Assertions.assertTrue(server("gs://b/p", awsKeys));
++        Assertions.assertTrue(server("oss://b/p", awsKeys));
++        Assertions.assertTrue(server("hdfs://nn:8020/p", awsKeys));
++        Assertions.assertTrue(server("file:///etc/passwd", awsKeys));
++        Assertions.assertTrue(server("/etc/passwd", awsKeys));
++        Assertions.assertTrue(ServerStorageIdentityCheck.usesServerIdentity(
++                List.of("s3://b/ok", "hdfs://nn/p"), awsKeys));
++    }
++
++    // ------------------------------------------- the statements -----------------------------------------------
++
++    /** Analyzes (when it can) and authorizes `sql`; returns what it threw, or null. */
++    private static Throwable authorize(String sql, boolean hasOperate) {
++        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
++            if (!hasOperate) {
++                authorizer.when(() -> Authorizer.checkSystemAction(Mockito.any(), Mockito.eq(PrivilegeType.OPERATE)))
++                        .thenThrow(new AccessDeniedException());
++            }
++            StatementBase stmt = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
++            try {
++                Analyzer.analyze(stmt, connectContext);
++            } catch (Throwable t) {
++                if (stmt instanceof QueryStatement) {
++                    // OUTFILE builds its storage properties during analysis.
++                    return t;
++                }
++                // A load, export or file table names its storage in the statement itself; analysis here may
++                // fail on a missing broker or bucket, which the authorization check does not need.
++            }
++            try {
++                Authorizer.check(stmt, connectContext);
++                return null;
++            } catch (Throwable t) {
++                return t;
++            }
++        }
++    }
++
++    private static boolean refused(Throwable t) {
++        return t instanceof ErrorReportException e &&
++                e.getErrorCode() == ErrorCode.ERR_ACCESS_DENIED_SERVER_STORAGE_IDENTITY;
++    }
++
++    private static final String OUTFILE = "SELECT id FROM db_ssi.t INTO OUTFILE 's3://bucket/out/' " +
++            "FORMAT AS CSV PROPERTIES (%s)";
++    private static final String LOAD = "LOAD LABEL db_ssi.l_%s (DATA INFILE('s3://bucket/in/*') INTO TABLE t " +
++            "FORMAT AS 'parquet') WITH BROKER (%s)";
++    private static final String EXPORT = "EXPORT TABLE db_ssi.t TO 's3://bucket/export/' WITH BROKER (%s)";
++    private static final String FILE_TABLE = "CREATE EXTERNAL TABLE db_ssi.ft_%s (id BIGINT) ENGINE = file " +
++            "PROPERTIES ('path' = 's3://bucket/in/', 'format' = 'parquet', %s)";
++
++    private static List<String> statements(String props, String suffix) {
++        return List.of(String.format(OUTFILE, props), String.format(LOAD, suffix, props),
++                String.format(EXPORT, props), String.format(FILE_TABLE, suffix, props));
++    }
++
++    @ParameterizedTest
++    @ValueSource(strings = {NO_KEYS, PROFILE})
++    public void withoutOwnCredentialsAUserWithoutOperateIsRefused(String props) {
++        for (String sql : statements(props, "a")) {
++            Throwable t = authorize(sql, false);
++
++            Assertions.assertTrue(refused(t), sql + " -> " + t);
++        }
++    }
++
++    @Test
++    public void withoutOwnCredentialsAUserWithOperateGetsPastTheCheck() {
++        for (String sql : statements(NO_KEYS, "b")) {
++            Throwable t = authorize(sql, true);
++
++            Assertions.assertFalse(refused(t), sql + " -> " + t);
++        }
++    }
++
++    @Test
++    public void ownCredentialsNeedNoOperate() {
++        for (String sql : statements(KEYS, "c")) {
++            Throwable t = authorize(sql, false);
++
++            Assertions.assertFalse(refused(t), sql + " -> " + t);
++        }
++    }
++}
+diff --git a/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java b/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
+index ae1536bf4b1..8c11ddebebd 100644
+--- a/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
++++ b/fe/fe-core/src/test/java/com/starrocks/sql/analyzer/PrivilegeCheckerTest.java
+@@ -2308,11 +2308,12 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
+             ));
+         }
+         // create load & check table privilege
++        // With credentials of its own: without them the load needs OPERATE on SYSTEM (ServerStorageIdentityCheck).
+         createSql = "LOAD LABEL db1.job_name1" +
+-                "(DATA INFILE('hdfs://test:8080/user/starrocks/data/input/example1.csv') " +
++                "(DATA INFILE('s3://bucket/user/starrocks/data/input/example1.csv') " +
+                 "INTO TABLE tbl1) " +
+                 "WITH BROKER 'my_broker'" +
+-                "('username' = 'test_name','password' = 'pwd') " +
++                "('aws.s3.access_key' = 'ak','aws.s3.secret_key' = 'sk') " +
+                 "PROPERTIES ('timeout' = '3600');";
+         verifyGrantRevoke(
+                 createSql,
+@@ -2425,9 +2426,10 @@ public class PrivilegeCheckerTest extends StarRocksTestBase {
+     public void testExportStmt() throws Exception {
+ 
+         mockBroker();
++        // With credentials of its own: without them the export needs OPERATE on SYSTEM (ServerStorageIdentityCheck).
+         String createExportSql = "EXPORT TABLE db1.tbl1 " +
+-                "TO 'hdfs://hdfs_host:port/a/b/c/' " +
+-                "WITH BROKER 'broker0'";
++                "TO 's3://bucket/a/b/c/' " +
++                "WITH BROKER 'broker0' ('aws.s3.access_key' = 'ak', 'aws.s3.secret_key' = 'sk')";
+         String expectError =
+                 "Access denied; you need (at least one of) the EXPORT privilege(s) on TABLE tbl1 for this operation";
+         verifyGrantRevoke(
+diff --git a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
+index 3dec6119317..a696fc592b1 100644
+--- a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
++++ b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
+@@ -282,6 +282,10 @@ public enum ErrorCode {
+     ERR_ACCESS_DENIED_EXPLAIN_COSTS_UNDER_POLICY(5213, new byte[] {'4', '2', '0', '0', '0'},
+             "Access denied; EXPLAIN COSTS shows the column statistics of the whole table %s, and a row access or " +
+                     "column masking policy applies to that table for this user"),
++    ERR_ACCESS_DENIED_SERVER_STORAGE_IDENTITY(5214, new byte[] {'4', '2', '0', '0', '0'},
++            "Access denied; %s names no credentials of its own for its storage, so it would run with the cluster's " +
++                    "own identity (instance profile, default credential chain, managed identity, keytab or " +
++                    "configured keys), which needs the OPERATE privilege on SYSTEM"),
+ 
+     /**
+      * 5300 - 5399: Lock and Transaction
+-- 
+2.50.1 (Apple Git-155)
+
