@@ -1,0 +1,259 @@
+From 8222c84973d5518dd18c0af0023cc7322e6e65af Mon Sep 17 00:00:00 2001
+From: 1Pro-L4R8 <hoangquocvietbk2.13@gmail.com>
+Date: Tue, 3 Nov 2026 10:12:24 +0700
+Subject: [PATCH 8/9] Refuse EXPLAIN COSTS on tables under a row access or
+ masking policy
+
+EXPLAIN COSTS prints the optimizer's column statistics of every table a
+statement reads: minimum, maximum, null fraction and distinct count over
+all rows. A row access policy does not narrow them, so a user under a row
+filter read the range and cardinality of the rows it hides (measured on
+4.1.7: a user allowed ids 1 and 3 of an Iceberg table saw id [1.0, 4.0]).
+
+EXPLAIN COSTS is now refused with error 5213 when a row access or column
+masking policy applies to the user on any table the statement reads,
+through views and CTEs too. The other EXPLAIN levels print no column
+statistics and stay allowed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ExplainCostsPolicyCheck.java              |  54 ++++++++
+ .../sql/analyzer/AuthorizerStmtVisitor.java   |   2 +
+ .../ExplainCostsPolicyCheckTest.java          | 129 ++++++++++++++++++
+ .../java/com/starrocks/common/ErrorCode.java  |   3 +
+ 4 files changed, 188 insertions(+)
+ create mode 100644 fe/fe-core/src/main/java/com/starrocks/authorization/ExplainCostsPolicyCheck.java
+ create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/ExplainCostsPolicyCheckTest.java
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/authorization/ExplainCostsPolicyCheck.java b/fe/fe-core/src/main/java/com/starrocks/authorization/ExplainCostsPolicyCheck.java
+new file mode 100644
+index 00000000000..c1bf3efbce1
+--- /dev/null
++++ b/fe/fe-core/src/main/java/com/starrocks/authorization/ExplainCostsPolicyCheck.java
+@@ -0,0 +1,54 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.catalog.TableName;
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.AnalyzerUtils;
++import com.starrocks.sql.ast.StatementBase;
++
++/**
++ * EXPLAIN COSTS prints the column statistics the optimizer holds for each table: minimum, maximum, null
++ * fraction and distinct count, collected over every row. A row access policy does not narrow them, so a user
++ * under one reads the range and cardinality of the rows it hides; a masked column's statistics are hidden
++ * already but its table's other columns are not. So EXPLAIN COSTS is refused when a row access or column
++ * masking policy applies to the user on any table the statement reads. The other EXPLAIN levels print no
++ * column statistics and stay allowed.
++ */
++public final class ExplainCostsPolicyCheck {
++    private ExplainCostsPolicyCheck() {
++    }
++
++    public static void check(StatementBase statement, ConnectContext context) {
++        if (!statement.isExplain() || statement.getExplainLevel() != StatementBase.ExplainLevel.COSTS) {
++            return;
++        }
++        if (context == null || context.getCurrentUserIdentity() == null) {
++            return;
++        }
++        for (TableName name : AnalyzerUtils.collectAllTable(statement).keySet()) {
++            TableName table = new TableName(
++                    name.getCatalog() == null ? context.getCurrentCatalog() : name.getCatalog(),
++                    name.getDb() == null ? context.getDatabase() : name.getDb(),
++                    name.getTbl());
++            if (ColumnPrivilege.isRestrictedByPolicy(context, table)) {
++                throw ErrorReportException.report(ErrorCode.ERR_ACCESS_DENIED_EXPLAIN_COSTS_UNDER_POLICY,
++                        table.toString());
++            }
++        }
++    }
++}
+diff --git a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
+index 74aaedff377..75e8fbab952 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
++++ b/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/AuthorizerStmtVisitor.java
+@@ -19,6 +19,7 @@ import com.google.common.collect.Lists;
+ import com.starrocks.authorization.AccessDeniedException;
+ import com.starrocks.authorization.AuthorizationMgr;
+ import com.starrocks.authorization.ColumnPrivilege;
++import com.starrocks.authorization.ExplainCostsPolicyCheck;
+ import com.starrocks.authorization.ObjectType;
+ import com.starrocks.authorization.PrivilegeBuiltinConstants;
+ import com.starrocks.authorization.PrivilegeException;
+@@ -281,6 +282,7 @@ public class AuthorizerStmtVisitor implements AstVisitorExtendInterface<Void, Co
+ 
+     public void check(StatementBase statement, ConnectContext context) {
+         visit(statement, context);
++        ExplainCostsPolicyCheck.check(statement, context);
+     }
+ 
+     // --------------------------------- Query Statement -------------------------------------
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/ExplainCostsPolicyCheckTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/ExplainCostsPolicyCheckTest.java
+new file mode 100644
+index 00000000000..443d2279059
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/ExplainCostsPolicyCheckTest.java
+@@ -0,0 +1,129 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.catalog.TableName;
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.Analyzer;
++import com.starrocks.sql.analyzer.Authorizer;
++import com.starrocks.sql.ast.StatementBase;
++import com.starrocks.sql.ast.expression.Expr;
++import com.starrocks.sql.parser.SqlParser;
++import com.starrocks.utframe.StarRocksAssert;
++import com.starrocks.utframe.UtFrameUtils;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++
++import java.util.Map;
++
++/**
++ * EXPLAIN COSTS prints the column statistics of the whole table, which a row access policy does not narrow, so
++ * it is refused when a row access or masking policy applies to the user on a table the statement reads.
++ */
++public class ExplainCostsPolicyCheckTest {
++    private static ConnectContext connectContext;
++
++    @BeforeAll
++    public static void beforeClass() throws Exception {
++        UtFrameUtils.createMinStarRocksCluster();
++        connectContext = UtFrameUtils.createDefaultCtx();
++        new StarRocksAssert(connectContext).withDatabase("db_ecp").useDatabase("db_ecp")
++                .withTable("CREATE TABLE customers (id BIGINT, phone VARCHAR(64)) DUPLICATE KEY(id) " +
++                        "DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num' = '1')")
++                .withTable("CREATE TABLE other (id BIGINT) DUPLICATE KEY(id) " +
++                        "DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num' = '1')")
++                .withView("CREATE VIEW v_customers AS SELECT id, phone FROM db_ecp.customers");
++    }
++
++    private static Expr expr(String sql) {
++        return SqlParser.parseSqlToExpr(sql, connectContext.getSessionVariable().getSqlMode());
++    }
++
++    /**
++     * Analyzes `sql` and runs the authorization check with a row filter or masks on db_ecp.customers only;
++     * returns what it threw, or null.
++     */
++    private static Throwable authorize(String sql, Expr rowFilter, Map<String, Expr> masks) {
++        try (MockedStatic<Authorizer> authorizer = Mockito.mockStatic(Authorizer.class, Mockito.CALLS_REAL_METHODS)) {
++            authorizer.when(() -> Authorizer.getRowAccessPolicy(Mockito.any(),
++                    Mockito.argThat((TableName t) -> t != null && "customers".equals(t.getTbl())))).thenReturn(rowFilter);
++            authorizer.when(() -> Authorizer.getColumnMaskingPolicy(Mockito.any(),
++                    Mockito.argThat((TableName t) -> t != null && "customers".equals(t.getTbl())), Mockito.any()))
++                    .thenReturn(masks);
++            StatementBase stmt = SqlParser.parse(sql, connectContext.getSessionVariable()).get(0);
++            try {
++                Analyzer.analyze(stmt, connectContext);
++                Authorizer.check(stmt, connectContext);
++                return null;
++            } catch (Throwable t) {
++                return t;
++            }
++        }
++    }
++
++    private static boolean refusedForPolicy(Throwable t) {
++        return t instanceof ErrorReportException e &&
++                e.getErrorCode() == ErrorCode.ERR_ACCESS_DENIED_EXPLAIN_COSTS_UNDER_POLICY;
++    }
++
++    @Test
++    public void aRowFilterRefusesExplainCosts() {
++        Throwable t = authorize("EXPLAIN COSTS SELECT id FROM db_ecp.customers", expr("id = 1"), Map.of());
++
++        Assertions.assertTrue(refusedForPolicy(t), String.valueOf(t));
++    }
++
++    @Test
++    public void aMaskRefusesExplainCosts() {
++        Throwable t = authorize("EXPLAIN COSTS SELECT id FROM db_ecp.customers", null, Map.of("phone", expr("NULL")));
++
++        Assertions.assertTrue(refusedForPolicy(t), String.valueOf(t));
++    }
++
++    @Test
++    public void aPolicyOnATableUnderAViewOrACteRefuses() {
++        Throwable view = authorize("EXPLAIN COSTS SELECT * FROM db_ecp.v_customers", expr("id = 1"), Map.of());
++        Throwable cte = authorize("EXPLAIN COSTS WITH x AS (SELECT id FROM db_ecp.customers) " +
++                "SELECT * FROM db_ecp.other JOIN x ON other.id = x.id", expr("id = 1"), Map.of());
++
++        Assertions.assertTrue(refusedForPolicy(view), String.valueOf(view));
++        Assertions.assertTrue(refusedForPolicy(cte), String.valueOf(cte));
++    }
++
++    @Test
++    public void theOtherExplainLevelsStayAllowed() {
++        for (String level : new String[] {"", "LOGICAL", "VERBOSE"}) {
++            Throwable t = authorize("EXPLAIN " + level + " SELECT id FROM db_ecp.customers", expr("id = 1"),
++                    Map.of("phone", expr("NULL")));
++
++            Assertions.assertNull(t, level);
++        }
++    }
++
++    @Test
++    public void explainCostsWithoutAPolicyStaysAllowed() {
++        Throwable none = authorize("EXPLAIN COSTS SELECT id FROM db_ecp.customers", null, Map.of());
++        Throwable other = authorize("EXPLAIN COSTS SELECT id FROM db_ecp.other", expr("id = 1"),
++                Map.of("phone", expr("NULL")));
++
++        Assertions.assertNull(none);
++        Assertions.assertNull(other);
++    }
++}
+diff --git a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
+index d32840d3da3..3dec6119317 100644
+--- a/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
++++ b/fe/fe-spi/src/main/java/com/starrocks/common/ErrorCode.java
+@@ -279,6 +279,9 @@ public enum ErrorCode {
+     ERR_ACCESS_DENIED_MV_UNDER_POLICY(5212, new byte[] {'4', '2', '0', '0', '0'},
+             "Access denied; materialized view %s cannot read table %s: a row access or column masking policy " +
+                     "applies to that table for user %s, and a materialized view stores data without the policy"),
++    ERR_ACCESS_DENIED_EXPLAIN_COSTS_UNDER_POLICY(5213, new byte[] {'4', '2', '0', '0', '0'},
++            "Access denied; EXPLAIN COSTS shows the column statistics of the whole table %s, and a row access or " +
++                    "column masking policy applies to that table for this user"),
+ 
+     /**
+      * 5300 - 5399: Lock and Transaction
+-- 
+2.50.1 (Apple Git-155)
+

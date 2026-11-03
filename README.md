@@ -22,6 +22,8 @@ until a StarRocks release contains it, any StarRocks with Iceberg catalogs is ex
 | `0005` | `SHOW CREATE CATALOG` had no privilege check: any user who could log in read every external catalog's properties (endpoints, warehouse, the first and last characters of its keys). It now needs a privilege on the catalog, as `SHOW CATALOGS` does to list it. | No upstream issue or fix yet. |
 | `0006` | `FILES()` had no privilege: any user read and wrote object storage through it with no table privilege, mask or row filter, and with `aws.s3.use_instance_profile` through the BE's own cloud identity. Every use (`SELECT ... FROM FILES`, `INSERT INTO FILES`, `DESC FILES`) now needs OPERATE on SYSTEM (error 5211). | Open upstream: [#79980](https://github.com/StarRocks/starrocks/issues/79980), [#80233](https://github.com/StarRocks/starrocks/issues/80233). |
 | `0007` | A materialized view's refresh reads its base tables without its user's masks and row filters and stores the result, so a user under both could create a materialized view over the table and read it all in the clear. Creating one over a table where such a policy applies to the creator is refused (error 5212), and a refresh stops once its user comes under one. Strict by design: the refusal does not look at which columns the view reads. | No upstream issue or fix yet. |
+| `0008` | `EXPLAIN COSTS` printed the optimizer's column statistics of every table a statement reads (minimum, maximum, null fraction, distinct count over all rows), so a user under a row filter read the range and cardinality of the rows it hides. It is now refused (error 5213) when a row access or column masking policy on such a table applies to the user; the other EXPLAIN levels print no column statistics and stay allowed. | No upstream issue or fix yet. |
+| `0009` | `BROKER LOAD`, `EXPORT`, `SELECT ... INTO OUTFILE` and `CREATE EXTERNAL TABLE ... ENGINE = file` accepted storage properties with no credentials of their own and then ran with the cluster's identity: an instance profile, the AWS default credential chain (which the S3 client uses whenever no keys are given), a web identity token, an Azure managed identity, a GCE service account, a keytab on the server, or the keys in be.conf. Any user, even one with no privilege, could write query results to any bucket that identity reaches. These statements now need OPERATE on SYSTEM (error 5214) unless every location is on an object store and the properties carry that store's own credentials and turn on no cluster-identity switch (the switches take precedence over keys). HDFS and local paths always need it. | No upstream issue or fix yet. |
 
 Drop a patch when the upstream release in `UPSTREAM` contains it.
 
@@ -66,6 +68,14 @@ Run it against the official image too: the checks tagged with a patch number mus
 shows that each check detects what its patch fixes. Checks tagged `-` (controls) and `guard` (a
 behaviour a patch must not break) pass on both.
 
+Result on 2026-11-03 against `4.1.7-egret.3` (patches `0001` to `0007`) with the checks for `0008` and
+`0009` added: 45/51 passed, and the 6 failures were exactly those checks (bob, under a row filter, read
+`id-->[1.0, 4.0, ...]` through `EXPLAIN COSTS` on orders while he may see ids 1 and 3; eve, with no grant,
+reached the object store through `INTO OUTFILE` with no keys and with `aws.s3.use_instance_profile`;
+mallory's `BROKER LOAD` and `ENGINE = file` table with no keys were accepted, and the load's FE then
+tried the environment's credential providers). The OUTFILE and BROKER LOAD keys are redacted in
+`fe.audit.log`.
+
 Result on 2026-11-02 against `4.1.7-egret.2` (patches `0001` to `0003`) with the checks for `0004` to
 `0007` added: 28/34 passed, and the 6 failures were exactly those checks (bob read clear emails and `eu`
 rows through the HTTP SQL API and Arrow Flight SQL; eve, with no grant, read `SHOW CREATE CATALOG ice`;
@@ -98,11 +108,11 @@ The local build used JDK 21 with `--release 17`; the official jars are built wit
   StarRocks resource names (`catalog`, `database`, `table`, `column`). Without the enricher it never
   requests the tags (upstream [#67458](https://github.com/StarRocks/starrocks/issues/67458) asks for
   this; PR [#70883](https://github.com/StarRocks/starrocks/pull/70883) documents it).
-- `EXPLAIN COSTS` shows a filtered user the statistics of the whole table (row count, min and max of unmasked
-  columns); masked columns show no values.
-- Loads (`BROKER LOAD`, pipes, routine load) that name `aws.s3.use_instance_profile` read with the BE's
-  identity; they need INSERT on the target table. Run BE/CN without a cloud role, or with one limited to the
-  storage the engine must read.
+- Every EXPLAIN level shows a user the estimated row count (`cardinality`) and the text of the user's own row
+  filter, and `SHOW STATS META` shows the row count in the statistics: table-level metadata, as in Trino.
+  The column statistics are what `0008` refuses.
+- A catalog, storage volume, resource or repository an administrator creates with the cluster's identity is
+  used by whoever may use it; that is the administrator's choice and `0009` does not touch it.
 - Arrow Flight SQL fails on the official images unless the FE JVM gets
   `--add-opens=java.base/java.nio=ALL-UNNAMED`; the e2e adds it to test `0004`.
 
