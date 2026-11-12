@@ -1,2 +1,0 @@
-// A Java security policy that grants nothing: with UDF_JAVA_POLICY=1 probe.sh mounts it at
-// /opt/egret-probe/deny-all.policy and names it in the BE's JAVA_OPTS (-Djava.security.policy).

@@ -1,6 +1,6 @@
 """An egress canary: canary.py <dir> <port> <log>.
 
-GET /files/<name> serves <dir>/<name> (the UDF jar, the JDBC driver). Any other request gets 200 and
+GET /files/<name> serves <dir>/<name> (the JDBC driver). Any other request gets 200 and
 appends "<path> <peer>" to <log>, which the checks read with probe_lib.canary_hits."""
 import http.server
 import os

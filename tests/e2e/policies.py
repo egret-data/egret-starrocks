@@ -20,10 +20,9 @@ root:  the orders row filter too. Root is still subject to row filters and masks
        "guard" check fail if patch 0001 ever stops exempting those jobs.
 
 With no flag the output is exactly what run.sh's checks expect. The probe flags (probe.sh) add:
---probe        udfdev (bob's grant, mask and row filter on demo.customers, CREATE FUNCTION in demo, USAGE on
-               demo's functions), loader (INSERT on demo.s_target, r_target and pk_target, the row filter
-               id = 1 on pk_target) and, on hive, jdbc and paimon, the policies ice.sales.orders has: alice
-               reads all, bob and mallory get MASK_NULL on email and the row filter region = 'us', eve nothing.
+--probe        loader (INSERT on demo.s_target, r_target and pk_target, the row filter id = 1 on pk_target)
+               and, on hive, jdbc and paimon, the policies ice.sales.orders has: alice reads all, bob and
+               mallory get MASK_NULL on email and the row filter region = 'us', eve nothing.
 --version N    policyVersion N (the plugin reloads when it grows), for a run that revokes a grant.
 --revoke loader  leave out loader's INSERT items (needs --probe; the row filter stays).
 """
@@ -75,11 +74,8 @@ def policy(name, policy_type, resources, **items):
     }, **items))
 
 
-# udfdev is bob on demo.customers (probe stacks only).
-DEMO_BOB = ["bob", "udfdev"] if PROBE else ["bob"]
 for catalog, db in (("default_catalog", "demo"), ("ice", "sales")):
-    users = ["alice", "bob", "tina"] + (["udfdev"] if PROBE and catalog == "default_catalog" else [])
-    policy(f"grant-{catalog}", 0, res(catalog, db, "*", "*"), policyItems=[item(users)])
+    policy(f"grant-{catalog}", 0, res(catalog, db, "*", "*"), policyItems=[item(["alice", "bob", "tina"])])
 policy("grant-mallory-select", 0, res("default_catalog", "demo", "*", "*"), policyItems=[item(["mallory"])])
 policy("grant-mallory-tables", 0, res("default_catalog", "demo", "*"),
        policyItems=[item(["mallory"], accesses=[{"type": a, "isAllowed": True}
@@ -96,11 +92,11 @@ policy("grant-mallory-views", 0, {"catalog": values("default_catalog"), "databas
                                   "view": values("*")},
        policyItems=[item(["mallory"], accesses=[{"type": "drop", "isAllowed": True}])])
 policy("mask-phone", 1, res("default_catalog", "demo", "customers", "phone"),
-       dataMaskPolicyItems=[item(DEMO_BOB + ["mallory"], dataMaskInfo={"dataMaskType": "MASK_NULL"})])
+       dataMaskPolicyItems=[item(["bob", "mallory"], dataMaskInfo={"dataMaskType": "MASK_NULL"})])
 policy("mask-email", 1, res("ice", "sales", "orders", "email"),
        dataMaskPolicyItems=[item(["bob"], dataMaskInfo={"dataMaskType": "MASK_NULL"})])
 policy("filter-customers", 2, res("default_catalog", "demo", "customers"),
-       rowFilterPolicyItems=[item(DEMO_BOB + ["mallory"], rowFilterInfo={"filterExpr": "id = 1"})])
+       rowFilterPolicyItems=[item(["bob", "mallory"], rowFilterInfo={"filterExpr": "id = 1"})])
 policy("filter-orders", 2, res("ice", "sales", "orders"),
        rowFilterPolicyItems=[item(["bob", "root"], rowFilterInfo={"filterExpr": "region = 'us'"})])
 policy("audit-loader", 0, res("default_catalog", "starrocks_audit_db__", "starrocks_audit_tbl__"),
@@ -112,11 +108,6 @@ if PROBE:
     def grants(*types):
         return [{"type": t, "isAllowed": True} for t in types]
 
-    policy("grant-udfdev-create-function", 0, {"catalog": values("default_catalog"), "database": values("demo")},
-           policyItems=[item(["udfdev"], accesses=grants("create function"))])
-    policy("grant-udfdev-use-function", 0, {"catalog": values("default_catalog"), "database": values("demo"),
-                                            "function": values("*")},
-           policyItems=[item(["udfdev"], accesses=grants("usage"))])
     policy("filter-pk-target", 2, res("default_catalog", "demo", "pk_target"),
            rowFilterPolicyItems=[item(["loader"], rowFilterInfo={"filterExpr": "id = 1"})])
     # The policies of ice.sales.orders, on the other catalogs. Not root's filter: that one exists for the

@@ -19,8 +19,6 @@ class Verdict(enum.Enum):
 
 
 class Probe(enum.Enum):
-    UDF = "udf"
-    PYTHON_UDF = "python-udf"
     HIVE = "hive"
     JDBC = "jdbc"
     PAIMON = "paimon"
@@ -42,7 +40,7 @@ def skipped_probes(env_value: str) -> set[Probe]:
 
 @dataclasses.dataclass
 class ProbeCheck:
-    id: str                                   # "U5", "C14-paimon", ...
+    id: str                                   # "C2-jdbc", "C14-paimon", ...
     probe: Probe
     name: str
     sight: Callable[[], bool]                 # True when the harness can see the leak content

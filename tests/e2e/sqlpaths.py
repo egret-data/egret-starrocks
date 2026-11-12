@@ -12,9 +12,9 @@ import adbc_driver_flightsql.dbapi as flight_sql
 import mysql.connector
 
 PORT = HTTP_PORT = FLIGHT_PORT = None
-# udfdev, loader and nat exist only on a probe stack (policies.py --probe).
+# loader and nat exist only on a probe stack (policies.py --probe).
 PASSWORDS = {"root": "", "alice": "alicepw", "bob": "bobpw", "eve": "evepw", "svc": "svcpw", "tina": "tinapw", "mallory": "mallorypw",
-             "udfdev": "udfdevpw", "loader": "loaderpw", "nat": "natpw"}
+             "loader": "loaderpw", "nat": "natpw"}
 DENIED = "DENIED"
 
 

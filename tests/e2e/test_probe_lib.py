@@ -16,7 +16,7 @@ LEAKED = [(1, "us", "a@x.io")]
 
 
 def check(sight=lambda: True, actual=lambda: REFUSED, leaked=lambda r: r != REFUSED, na=lambda: None,
-          probe=Probe.UDF, id="U1", name="a check"):
+          probe=Probe.JDBC, id="C1", name="a check"):
     return ProbeCheck(id=id, probe=probe, name=name, sight=sight, actual=actual, leaked=leaked, na_reason=na)
 
 
@@ -32,17 +32,25 @@ class SkippedProbes(unittest.TestCase):
         self.assertEqual(skipped_probes(""), set())
 
     def test_two_names(self):
-        self.assertEqual(skipped_probes("udf,hive"), {Probe.UDF, Probe.HIVE})
+        self.assertEqual(skipped_probes("jdbc,hive"), {Probe.JDBC, Probe.HIVE})
 
     def test_whitespace(self):
-        self.assertEqual(skipped_probes(" udf , python-udf ,"), {Probe.UDF, Probe.PYTHON_UDF})
+        self.assertEqual(skipped_probes(" jdbc , paimon ,"), {Probe.JDBC, Probe.PAIMON})
         self.assertEqual(skipped_probes("   "), set())
 
     def test_unknown_name_exits_2(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as cm:
-                skipped_probes("udf,nope")
+                skipped_probes("jdbc,nope")
         self.assertEqual(cm.exception.code, 2)
+
+    def test_dropped_udf_probes_are_unknown(self):
+        # The UDF probe left the package: its names must stop a run rather than be skipped silently.
+        for name in ("udf", "python-udf"):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    skipped_probes(name)
+            self.assertEqual(cm.exception.code, 2)
 
 
 class RunChecks(unittest.TestCase):
@@ -51,7 +59,7 @@ class RunChecks(unittest.TestCase):
         return out.splitlines()[0]
 
     def test_enforced(self):
-        self.assertTrue(self.verdict_line([check()]).startswith("ENFORCED  [probe:udf]  U1 a check  DENIED"))
+        self.assertTrue(self.verdict_line([check()]).startswith("ENFORCED  [probe:jdbc]  C1 a check  DENIED"))
 
     def test_leak(self):
         self.assertTrue(self.verdict_line([check(actual=lambda: LEAKED)]).startswith("LEAK  "))
@@ -65,15 +73,15 @@ class RunChecks(unittest.TestCase):
         self.assertTrue(self.verdict_line([check(sight=lambda: False, actual=lambda: LEAKED)]).startswith("BLIND"))
 
     def test_na_carries_the_reason_and_wins_over_the_rest(self):
-        line = self.verdict_line([check(na=lambda: "python3 not found", sight=lambda: False)])
+        line = self.verdict_line([check(na=lambda: "no partition listing", sight=lambda: False)])
         self.assertTrue(line.startswith("N/A  "))
-        self.assertIn("python3 not found", line)
+        self.assertIn("no partition listing", line)
 
     def test_skip_does_not_call_anything(self):
         def boom():
             raise AssertionError("called")
-        line = self.verdict_line([check(sight=boom, actual=boom, na=boom)], {Probe.UDF})
-        self.assertTrue(line.startswith("SKIP  [probe:udf]"))
+        line = self.verdict_line([check(sight=boom, actual=boom, na=boom)], {Probe.JDBC})
+        self.assertTrue(line.startswith("SKIP  [probe:jdbc]"))
 
     def test_exception_in_actual_is_error_with_class_and_message(self):
         def boom():
@@ -141,10 +149,10 @@ class RunChecks(unittest.TestCase):
 class CanaryHits(unittest.TestCase):
     def test_returns_only_lines_with_the_marker(self):
         with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
-            f.write("/udf-egress-1 172.17.0.2\n/other 172.17.0.2\n/udf-egress-1/x 10.0.0.1\n")
+            f.write("/c16-1 172.17.0.2\n/other 172.17.0.2\n/c16-1/x 10.0.0.1\n")
         try:
-            self.assertEqual(canary_hits(f.name, "udf-egress-1"),
-                             ["/udf-egress-1 172.17.0.2", "/udf-egress-1/x 10.0.0.1"])
+            self.assertEqual(canary_hits(f.name, "c16-1"),
+                             ["/c16-1 172.17.0.2", "/c16-1/x 10.0.0.1"])
         finally:
             os.unlink(f.name)
 
