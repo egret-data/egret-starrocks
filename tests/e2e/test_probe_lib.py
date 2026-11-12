@@ -1,0 +1,130 @@
+"""Unit tests of probe_lib: python -I -m unittest tests/e2e/test_probe_lib.py (no Docker needed)."""
+import contextlib
+import io
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import probe_lib  # noqa: E402
+from probe_lib import Probe, ProbeCheck, Verdict, canary_hits, run_checks, skipped_probes  # noqa: E402
+
+REFUSED = "DENIED"
+LEAKED = [(1, "us", "a@x.io")]
+
+
+def check(sight=lambda: True, actual=lambda: REFUSED, leaked=lambda r: r != REFUSED, na=lambda: None,
+          probe=Probe.UDF, id="U1", name="a check"):
+    return ProbeCheck(id=id, probe=probe, name=name, sight=sight, actual=actual, leaked=leaked, na_reason=na)
+
+
+def run(checks, skipped=frozenset()):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        status = run_checks(checks, set(skipped))
+    return status, out.getvalue()
+
+
+class SkippedProbes(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(skipped_probes(""), set())
+
+    def test_two_names(self):
+        self.assertEqual(skipped_probes("udf,hive"), {Probe.UDF, Probe.HIVE})
+
+    def test_whitespace(self):
+        self.assertEqual(skipped_probes(" udf , python-udf ,"), {Probe.UDF, Probe.PYTHON_UDF})
+        self.assertEqual(skipped_probes("   "), set())
+
+    def test_unknown_name_exits_2(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                skipped_probes("udf,nope")
+        self.assertEqual(cm.exception.code, 2)
+
+
+class RunChecks(unittest.TestCase):
+    def verdict_line(self, checks, skipped=frozenset()):
+        _, out = run(checks, skipped)
+        return out.splitlines()[0]
+
+    def test_enforced(self):
+        self.assertTrue(self.verdict_line([check()]).startswith("ENFORCED  [probe:udf]  U1 a check  DENIED"))
+
+    def test_leak(self):
+        self.assertTrue(self.verdict_line([check(actual=lambda: LEAKED)]).startswith("LEAK  "))
+
+    def test_blind_even_when_actual_is_a_refusal(self):
+        status, out = run([check(sight=lambda: False, actual=lambda: REFUSED)])
+        self.assertTrue(out.startswith("BLIND  "))
+        self.assertEqual(status, 1)
+
+    def test_blind_even_when_actual_leaks(self):
+        self.assertTrue(self.verdict_line([check(sight=lambda: False, actual=lambda: LEAKED)]).startswith("BLIND"))
+
+    def test_na_carries_the_reason_and_wins_over_the_rest(self):
+        line = self.verdict_line([check(na=lambda: "python3 not found", sight=lambda: False)])
+        self.assertTrue(line.startswith("N/A  "))
+        self.assertIn("python3 not found", line)
+
+    def test_skip_does_not_call_anything(self):
+        def boom():
+            raise AssertionError("called")
+        line = self.verdict_line([check(sight=boom, actual=boom, na=boom)], {Probe.UDF})
+        self.assertTrue(line.startswith("SKIP  [probe:udf]"))
+
+    def test_exception_in_actual_is_error_with_class_and_message(self):
+        def boom():
+            raise ValueError("kaput")
+        status, out = run([check(actual=boom)])
+        self.assertTrue(out.startswith("ERROR  "))
+        self.assertIn("ValueError", out)
+        self.assertIn("kaput", out)
+        self.assertEqual(status, 1)
+
+    def test_exception_in_sight_or_leaked_is_error(self):
+        def boom(*_):
+            raise RuntimeError("x")
+        self.assertTrue(self.verdict_line([check(sight=boom)]).startswith("ERROR"))
+        self.assertTrue(self.verdict_line([check(leaked=boom)]).startswith("ERROR"))
+
+    def test_a_broken_check_does_not_stop_the_run(self):
+        def boom():
+            raise ValueError("x")
+        _, out = run([check(actual=boom, id="A"), check(id="B")])
+        self.assertEqual([l.split()[0] for l in out.splitlines()[:2]], ["ERROR", "ENFORCED"])
+
+    def test_result_is_cut_at_110_characters(self):
+        line = self.verdict_line([check(actual=lambda: "x" * 300)])
+        self.assertTrue(line.endswith("x" * 107 + "..."))
+
+    def test_exit_status_leak_is_zero_skip_and_na_are_zero(self):
+        status, _ = run([check(actual=lambda: LEAKED), check(na=lambda: "r", id="N"), check(id="S", probe=Probe.HIVE)],
+                        {Probe.HIVE})
+        self.assertEqual(status, 0)
+
+    def test_summary_counts_every_verdict(self):
+        _, out = run([check(), check(actual=lambda: LEAKED), check(sight=lambda: False)])
+        summary = out.strip().splitlines()[-1]
+        for fragment in ("ENFORCED 1", "LEAK 1", "BLIND 1", "N/A 0", "SKIP 0", "ERROR 0"):
+            self.assertIn(fragment, summary)
+
+
+class CanaryHits(unittest.TestCase):
+    def test_returns_only_lines_with_the_marker(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write("/udf-egress-1 172.17.0.2\n/other 172.17.0.2\n/udf-egress-1/x 10.0.0.1\n")
+        try:
+            self.assertEqual(canary_hits(f.name, "udf-egress-1"),
+                             ["/udf-egress-1 172.17.0.2", "/udf-egress-1/x 10.0.0.1"])
+        finally:
+            os.unlink(f.name)
+
+    def test_missing_log_is_no_hits(self):
+        self.assertEqual(canary_hits("/nonexistent/canary.log", "x"), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
