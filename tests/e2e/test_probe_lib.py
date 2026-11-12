@@ -134,6 +134,15 @@ class RunChecks(unittest.TestCase):
         line = self.verdict_line([check(actual=lambda: "x" * 300)])
         self.assertTrue(line.endswith("x" * 107 + "..."))
 
+    def test_na_reason_is_printed_whole_on_one_line(self):
+        reason = "first: ERROR 1064: " + "y" * 200 + "\nsecond: ERROR 5502: Unknown table"
+        _, out = run([check(na=lambda: reason)])
+        line = out.splitlines()[0]
+        self.assertTrue(line.startswith("N/A  [probe:jdbc]  C1 a check  "), line)
+        self.assertTrue(line.endswith("second: ERROR 5502: Unknown table"), line)
+        self.assertIn("y" * 200, line)
+        self.assertIn("N/A 1", out.strip().splitlines()[-1])
+
     def test_exit_status_leak_is_zero_skip_and_na_are_zero(self):
         status, _ = run([check(actual=lambda: LEAKED), check(na=lambda: "r", id="N"), check(id="S", probe=Probe.HIVE)],
                         {Probe.HIVE})

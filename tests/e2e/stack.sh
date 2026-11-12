@@ -139,6 +139,7 @@ stack_auditloader() {
             n=$(root -N -e "SELECT count(*) FROM starrocks_audit_db__.starrocks_audit_tbl__ WHERE stmt LIKE '%egret-audit-probe%' AND \`user\` = 'root' AND stmt NOT LIKE '%starrocks_audit_tbl__%'")
             if [ "$n" != 0 ]; then
                 echo "AuditLoader is loading"
+                AUDITLOADER_LOADING=1
                 break
             fi
             sleep 2

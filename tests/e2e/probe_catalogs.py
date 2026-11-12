@@ -25,7 +25,9 @@ CANARY_LOG = sys.argv[5]
 RUN_ID = sys.argv[6]
 SR_CONTAINER = "egs-probe-sr"  # probe.sh's $NAME-sr
 FE_AUDIT_LOG = "/data/deploy/starrocks/fe/log/fe.audit.log"
-CANARY = "http://host.docker.internal:18778"  # probe.sh's CANARY_PORT, as the StarRocks container reaches it
+CANARY = "http://host.docker.internal:18778"
+# stack.sh's stack_auditloader saw the plugin load rows: the audit table must then exist and be read (C15).
+AUDITLOADER_LOADING = os.environ.get("AUDITLOADER_LOADING") == "1"  # probe.sh's CANARY_PORT, as the StarRocks container reaches it
 
 # checks.py's literals (checks.py runs its checks on import, so they are copied, not imported).
 ORDERS_ALL = [(1, "us", "a@x.io"), (2, "eu", "b@x.io"), (3, "us", "c@x.io"), (4, "eu", "d@x.io")]
@@ -51,6 +53,8 @@ CATALOGS = [
         ("SHOW PARTITIONS FROM hive.sales.orders", "SHOW PARTITIONS"),
         ("SELECT * FROM information_schema.partitions_meta WHERE DB_NAME = 'sales' AND TABLE_NAME = 'orders'",
          "information_schema.partitions_meta"),
+        ("SELECT * FROM hive.information_schema.partitions_meta WHERE DB_NAME = 'sales' AND TABLE_NAME = 'orders'",
+         "hive.information_schema.partitions_meta"),
     )),
 ]
 
@@ -168,7 +172,9 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
         r = text("root", "SELECT count(*) FROM starrocks_audit_db__.starrocks_audit_tbl__ "
                          f"WHERE stmt LIKE '%{create_stmt}%' AND stmt LIKE '%{pattern}%' "
                          "AND stmt NOT LIKE '%starrocks_audit_tbl__%'")
-        if isinstance(r, str) and "starrocks_audit_db__" in r:  # the official images have no audit table
+        # Only "no such database / table" means no audit table (the official images); any other error is ERROR.
+        if isinstance(r, str) and ((r.startswith("ERROR 5501") and "starrocks_audit_db__" in r)
+                                   or (r.startswith("ERROR 5502") and "starrocks_audit_tbl__" in r)):
             return None
         if is_failure(r):
             raise RuntimeError(f"audit table: {r}")
@@ -188,7 +194,10 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
             return False
         for _ in range(15):
             n = audit_table(create_stmt)
-            if n is None or n > 0:
+            if n is None:
+                # Acceptable only where no AuditLoader was loading; on an image where it was, the table is blind.
+                return not AUDITLOADER_LOADING
+            if n > 0:
                 return True
             time.sleep(2)
         return False

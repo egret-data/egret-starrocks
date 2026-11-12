@@ -85,7 +85,10 @@ def run_checks(checks: list[ProbeCheck], skipped: set[Probe]) -> int:
         verdict, shown = _evaluate(c, skipped)
         counts[verdict] += 1
         text = str(shown)
-        if len(text) >= 110:
+        if verdict is Verdict.NA:
+            # An N/A reason is the measurement itself: printed whole, on the one line probe.sh counts.
+            text = " ".join(text.split())
+        elif len(text) >= 110:
             text = text[:107] + "..."
         print(f"{verdict.value}  [probe:{c.probe.value}]  {c.id} {c.name}  {text}")
     print("\n" + "  ".join(f"{v.value} {counts[v]}" for v in Verdict))

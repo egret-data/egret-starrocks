@@ -249,7 +249,7 @@ run_group() {
     if [ "$runner" = inns ]; then
         inns_phase 2>&1 | tee -a "$WORK/probe.out" || status=1
     else
-        "$PY" -I "$HERE/$file" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" "$BE_HTTP_PORT" "$CANARY_LOG" "$RUN_ID" 2>&1 \
+        AUDITLOADER_LOADING=${AUDITLOADER_LOADING:-0} "$PY" -I "$HERE/$file" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" "$BE_HTTP_PORT" "$CANARY_LOG" "$RUN_ID" 2>&1 \
             | tee -a "$WORK/probe.out" || status=1
     fi
 }
