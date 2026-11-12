@@ -4,8 +4,11 @@ python:3.12-slim container on the probe network, so it cannot use the venv, dock
 
     python -I /e2e/inns_checks.py <host> <run_id> <segment path> <segment sha256> <n3 pattern>
         [--auth user:pw] [--no-destructive] [--mutant-n8-root] [--n3-sight ok|no]
+        [--fe-host <fe service dns>] [--n3-na <reason>]
 
 <host> is the StarRocks container name, reachable by Docker's embedded DNS on the probe network;
+on kind <host> is the CN Service DNS name and --fe-host the FE Service DNS name (allin1 omits it,
+so both default to <host>); --n3-na marks N3 N/A when no S4 stream load was seeded (the kind case);
 the ports are the container-internal ones (not the published host ports). probe.sh finds the
 segment path + sha256 (SHOW TABLET + find, as root) and the n3 pattern (the S4 load label, confirmed
 in be.INFO) beforehand, and folds this script's verdict counts into the combined summary.
@@ -51,6 +54,14 @@ PORT_9070 = 9070    # recorded by N7 (spec)
 args = argparse.Namespace()
 
 
+def _host_for(port):
+    """On kind the CN and FE are separate Services. --fe-host routes the FE ports (8030 http, 9020
+    thrift) to the FE Service; the BE/CN ports stay on <host>. Unset (allin1) -> everything on <host>."""
+    if getattr(args, "fe_host", None) and port in (FE_HTTP, FE_THRIFT):
+        return args.fe_host
+    return args.host
+
+
 def detail(check, value):
     """The whole of a result the verdict line cuts at 110 chars, for the report (not counted by probe.sh)."""
     print(f"  detail {check}: {value}")
@@ -61,7 +72,7 @@ def detail(check, value):
 # HTTP client. A request that cannot be made raises, which the verdict model turns into ERROR.
 
 def http_req(method, port, path, auth=None, timeout=20):
-    conn = http.client.HTTPConnection(args.host, port, timeout=timeout)
+    conn = http.client.HTTPConnection(_host_for(port), port, timeout=timeout)
     try:
         headers = {}
         if auth:
@@ -75,7 +86,7 @@ def http_req(method, port, path, auth=None, timeout=20):
 
 def tcp_open(port, timeout=5):
     try:
-        with socket.create_connection((args.host, port), timeout=timeout):
+        with socket.create_connection((_host_for(port), port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -243,7 +254,7 @@ class TReader:
 def thrift_call(port, method, write_args, timeout=15):
     """Send one unframed strict-TBinaryProtocol CALL and read the reply. Returns ('reply', struct) or
     ('exception', TApplicationException-struct). Raises on a connection or protocol failure (-> ERROR)."""
-    sock = socket.create_connection((args.host, port), timeout=timeout)
+    sock = socket.create_connection((_host_for(port), port), timeout=timeout)
     sock.settimeout(timeout)
     try:
         w = TWriter()
@@ -537,8 +548,13 @@ def skip_line(cid, name, reason):
 def build_checks():
     checks = []
 
-    def add(cid, name, sight, actual, leaked):
-        checks.append(ProbeCheck(cid, IN, name, sight, actual, leaked))
+    def add(cid, name, sight, actual, leaked, na_reason=lambda: None):
+        checks.append(ProbeCheck(cid, IN, name, sight, actual, leaked, na_reason))
+
+    # On kind there is no seeded S4 stream load, so N3's log label does not exist. --n3-na marks N3
+    # (and its eve pass) N/A with that reason instead of BLIND, which would fail the run.
+    def n3_na():
+        return getattr(args, "n3_na", None)
 
     add("N1", "GET :8040/api/health (reachability control for N2-N11)", lambda: True, n1_actual, lambda r: False)
     if args.auth:
@@ -552,11 +568,11 @@ def build_checks():
         add("N2-eve", "GET :8040/varz with eve's credentials (H4)", be_sight, ea2, el2)
 
     a3, l3 = mk_http_get("N3", BE_HTTP, f"/greplog?pattern={_urlquote(args.n3_pattern)}", None, want_marker=args.n3_pattern)
-    add("N3", "GET :8040/greplog (BE log) without credentials", n3_sight, a3, l3)
+    add("N3", "GET :8040/greplog (BE log) without credentials", n3_sight, a3, l3, na_reason=n3_na)
     if args.auth:
         ea3, el3 = mk_http_get("N3", BE_HTTP, f"/greplog?pattern={_urlquote(args.n3_pattern)}", args.auth,
                                want_marker=args.n3_pattern)
-        add("N3-eve", "GET :8040/greplog with eve's credentials", n3_sight, ea3, el3)
+        add("N3-eve", "GET :8040/greplog with eve's credentials", n3_sight, ea3, el3, na_reason=n3_na)
 
     add("N6", "GET :8060/flags and /vars (brpc built-ins): not served", n6_sight, n6_actual, n6_leaked)
     add("N7", "TCP reachability of 9060/9050/8060/9070/9020 (recorded)", lambda: True, n7_actual, lambda r: False)
@@ -626,6 +642,10 @@ def main():
     p.add_argument("seg_sha")
     p.add_argument("n3_pattern")
     p.add_argument("--auth", default=None, help="user:pw sent as Basic auth in the mitigation variant")
+    p.add_argument("--fe-host", default=None,
+                   help="on kind, route the FE ports (8030 http, 9020 thrift) to a separate FE Service DNS name")
+    p.add_argument("--n3-na", default=None,
+                   help="mark N3 N/A with this reason (kind has no seeded S4 stream load to greplog)")
     p.add_argument("--no-destructive", action="store_true", help="skip N4, N5 and N11 (Task 7 on kind)")
     p.add_argument("--mutant-n8-root", action="store_true", help="feed N8's eve slot with root's identity")
     p.add_argument("--n3-sight", default="ok", choices=("ok", "no"),
