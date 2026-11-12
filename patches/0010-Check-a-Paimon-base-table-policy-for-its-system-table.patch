@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: egret <noreply@egret.local>
+Date: Thu, 12 Nov 2026 19:46:28 +0700
+Subject: [PATCH] Check a Paimon base-table policy for its system tables
+
+A Paimon system table (t$files, t$snapshots, t$partitions, ...) is a PaimonTable, not a
+MetadataTable, so patch 0001's refuse-under-policy check never reaches it. Refuse it to a
+user whom a row access or column masking policy on the base table applies to, reusing 0001's
+isRestrictedByPolicy and ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY. No base-SELECT check:
+Paimon system tables are already authorised by name.
+---
+ .../authorization/ColumnPrivilege.java        |  34 ++++
+ .../ColumnPrivilegePaimonSystemTableTest.java | 172 ++++++++++++++++++
+ 2 files changed, 206 insertions(+)
+ create mode 100644 fe/fe-core/src/test/java/com/starrocks/authorization/ColumnPrivilegePaimonSystemTableTest.java
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/authorization/ColumnPrivilege.java b/fe/fe-core/src/main/java/com/starrocks/authorization/ColumnPrivilege.java
+index 8bea1fa0..d40b6d34 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/authorization/ColumnPrivilege.java
++++ b/fe/fe-core/src/main/java/com/starrocks/authorization/ColumnPrivilege.java
+@@ -17,6 +17,7 @@ package com.starrocks.authorization;
+ import com.google.common.collect.Maps;
+ import com.starrocks.catalog.Column;
+ import com.starrocks.catalog.InternalCatalog;
++import com.starrocks.catalog.PaimonTable;
+ import com.starrocks.catalog.Table;
+ import com.starrocks.catalog.TableName;
+ import com.starrocks.catalog.View;
+@@ -53,6 +54,7 @@ import com.starrocks.sql.optimizer.transformer.RelationTransformer;
+ import com.starrocks.sql.optimizer.transformer.TransformerContext;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
++import org.apache.paimon.catalog.Identifier;
+ 
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -85,6 +87,11 @@ public class ColumnPrivilege {
+                 continue;
+             }
+ 
++            if (table instanceof PaimonTable paimonTable && isPaimonSystemTable(paimonTable)) {
++                refusePaimonSystemTableUnderPolicy(context, tableName, paimonTable);
++                continue;
++            }
++
+             if (table instanceof SystemTable && ((SystemTable) table).requireOperatePrivilege()) {
+                 try {
+                     Authorizer.checkSystemAction(context, PrivilegeType.OPERATE);
+@@ -233,6 +240,33 @@ public class ColumnPrivilege {
+         }
+     }
+ 
++    /**
++     * A Paimon system table ({@code t$files}, {@code t$snapshots}, {@code t$partitions}, ...) is resolved by the
++     * Paimon connector as a {@link PaimonTable} named {@code t$...}, not as a {@link MetadataTable}, so it skips
++     * {@link #checkMetadataTablePrivilege}. It is already authorised by its own name by the Authorizer; this adds
++     * only the policy refusal patch 0001 gives a native metadata table: a user whom a row access policy or a
++     * column masking policy on the base table {@code t} applies to cannot read it, because those policies cannot
++     * be applied to the file-level statistics, partition values and paths the system table exposes.
++     */
++    private static boolean isPaimonSystemTable(PaimonTable table) {
++        return new Identifier(table.getCatalogDBName(), table.getCatalogTableName()).isSystemTable();
++    }
++
++    public static void refusePaimonSystemTableUnderPolicy(ConnectContext context, TableName tableName,
++                                                          PaimonTable paimonTable) {
++        // As in checkMetadataTablePrivilege: a collect job runs as root on behalf of an already-checked query.
++        if (context.isMetadataContext()) {
++            return;
++        }
++        Identifier identifier = new Identifier(paimonTable.getCatalogDBName(), paimonTable.getCatalogTableName());
++        String catalog = tableName.getCatalog() == null ? paimonTable.getCatalogName() : tableName.getCatalog();
++        TableName baseTableName = new TableName(catalog, paimonTable.getCatalogDBName(), identifier.getTableName());
++        if (isRestrictedByPolicy(context, baseTableName)) {
++            throw ErrorReportException.report(ErrorCode.ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY,
++                    tableName.getTbl(), baseTableName.getTbl());
++        }
++    }
++
+     /**
+      * Whether a row access policy, or a column masking policy on any of its columns, applies to this user on the
+      * table. A copy of the table's data (a metadata table's statistics, a materialized view) cannot carry either
+diff --git a/fe/fe-core/src/test/java/com/starrocks/authorization/ColumnPrivilegePaimonSystemTableTest.java b/fe/fe-core/src/test/java/com/starrocks/authorization/ColumnPrivilegePaimonSystemTableTest.java
+new file mode 100644
+index 00000000..4f15cdb3
+--- /dev/null
++++ b/fe/fe-core/src/test/java/com/starrocks/authorization/ColumnPrivilegePaimonSystemTableTest.java
+@@ -0,0 +1,172 @@
++// Copyright 2021-present StarRocks, Inc. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package com.starrocks.authorization;
++
++import com.starrocks.catalog.Column;
++import com.starrocks.catalog.InternalCatalog;
++import com.starrocks.catalog.PaimonTable;
++import com.starrocks.catalog.TableName;
++import com.starrocks.catalog.UserIdentity;
++import com.starrocks.common.ErrorCode;
++import com.starrocks.common.ErrorReportException;
++import com.starrocks.qe.ConnectContext;
++import com.starrocks.sql.analyzer.Authorizer;
++import com.starrocks.sql.ast.expression.BoolLiteral;
++import com.starrocks.sql.ast.expression.Expr;
++import com.starrocks.sql.ast.expression.NullLiteral;
++import com.starrocks.utframe.StarRocksAssert;
++import com.starrocks.utframe.UtFrameUtils;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * A Paimon system table (t$files, t$snapshots, t$partitions, ...) exposes partition values, file paths and
++ * per-file statistics of its base table t. Patch 0010 refuses it to a user whom a row access or column masking
++ * policy on t applies to; it adds no base-SELECT requirement (the system table is already name-authorised).
++ */
++public class ColumnPrivilegePaimonSystemTableTest {
++    private static final String CATALOG = InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME;
++
++    private StubAccessController controller;
++    private ConnectContext ctx;
++
++    /** An external access controller whose policy answers each test sets. */
++    private static class StubAccessController extends ExternalAccessController {
++        Expr rowAccessPolicy = null;
++        Map<String, Expr> maskingPolicy = null;
++        final List<TableName> tableChecked = new ArrayList<>();
++
++        @Override
++        public void checkTableAction(ConnectContext context, TableName tableName, PrivilegeType privilegeType) {
++            tableChecked.add(tableName);
++        }
++
++        @Override
++        public void checkColumnAction(ConnectContext context, TableName tableName, String column,
++                                      PrivilegeType privilegeType) {
++        }
++
++        @Override
++        public Expr getRowAccessPolicy(ConnectContext context, TableName tableName) {
++            return rowAccessPolicy;
++        }
++
++        @Override
++        public Map<String, Expr> getColumnMaskingPolicy(ConnectContext context, TableName tableName,
++                                                        List<Column> columns) {
++            return maskingPolicy;
++        }
++    }
++
++    /** A PaimonTable that answers only the two name getters the check reads. */
++    private static class FakePaimonSystemTable extends PaimonTable {
++        @Override
++        public String getCatalogName() {
++            return CATALOG;
++        }
++
++        @Override
++        public String getCatalogDBName() {
++            return "db";
++        }
++
++        @Override
++        public String getCatalogTableName() {
++            return "t1$files";
++        }
++    }
++
++    @BeforeAll
++    public static void beforeClass() throws Exception {
++        UtFrameUtils.createMinStarRocksCluster();
++        ConnectContext root = UtFrameUtils.createDefaultCtx();
++        new StarRocksAssert(root).withDatabase("db").useDatabase("db").withTable("CREATE TABLE `t1` (\n" +
++                "  `id` bigint NULL,\n" +
++                "  `email` varchar(64) NULL\n" +
++                ") ENGINE=OLAP\n" +
++                "DUPLICATE KEY(`id`)\n" +
++                "DISTRIBUTED BY HASH(`id`) BUCKETS 1\n" +
++                "PROPERTIES (\"replication_num\" = \"1\");");
++    }
++
++    @BeforeEach
++    public void setUp() {
++        controller = new StubAccessController();
++        Authorizer.getInstance().setAccessControl(CATALOG, controller);
++        ctx = new ConnectContext();
++        ctx.setCurrentUserIdentity(new UserIdentity("frank", "%"));
++        ctx.setDatabase("db");
++        ctx.setThreadLocalInfo();
++    }
++
++    @AfterEach
++    public void tearDown() {
++        Authorizer.getInstance().setAccessControl(CATALOG, new NativeAccessController());
++    }
++
++    private static TableName systemTableName() {
++        return new TableName(CATALOG, "db", "t1$files");
++    }
++
++    private static ErrorCode errorCodeOf(Runnable check) {
++        ErrorReportException e = Assertions.assertThrows(ErrorReportException.class, check::run);
++        return e.getErrorCode();
++    }
++
++    @Test
++    public void testRefusedWhenRowAccessPolicyApplies() {
++        controller.rowAccessPolicy = new BoolLiteral(false);
++        ErrorCode code = errorCodeOf(() ->
++                ColumnPrivilege.refusePaimonSystemTableUnderPolicy(ctx, systemTableName(), new FakePaimonSystemTable()));
++        Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY, code);
++    }
++
++    @Test
++    public void testRefusedWhenColumnMaskingPolicyApplies() {
++        controller.maskingPolicy = Map.of("email", new NullLiteral());
++        ErrorCode code = errorCodeOf(() ->
++                ColumnPrivilege.refusePaimonSystemTableUnderPolicy(ctx, systemTableName(), new FakePaimonSystemTable()));
++        Assertions.assertEquals(ErrorCode.ERR_ACCESS_DENIED_METADATA_TABLE_UNDER_POLICY, code);
++    }
++
++    @Test
++    public void testAllowedWhenNoPolicy() {
++        Assertions.assertDoesNotThrow(() ->
++                ColumnPrivilege.refusePaimonSystemTableUnderPolicy(ctx, systemTableName(), new FakePaimonSystemTable()));
++    }
++
++    @Test
++    public void testEmptyMaskingPolicyDoesNotRefuse() {
++        controller.maskingPolicy = Collections.emptyMap();
++        Assertions.assertDoesNotThrow(() ->
++                ColumnPrivilege.refusePaimonSystemTableUnderPolicy(ctx, systemTableName(), new FakePaimonSystemTable()));
++    }
++
++    @Test
++    public void testMetadataContextIsNotRefused() {
++        controller.rowAccessPolicy = new BoolLiteral(false);
++        ctx.setMetadataContext(true);
++        Assertions.assertDoesNotThrow(() ->
++                ColumnPrivilege.refusePaimonSystemTableUnderPolicy(ctx, systemTableName(), new FakePaimonSystemTable()));
++    }
++}
