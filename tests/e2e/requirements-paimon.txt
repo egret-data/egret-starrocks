@@ -1,0 +1,5 @@
+# Installed with pip --no-deps (stack.sh's stack_venv): every pypaimon release declares pyarrow<20, which has no
+# wheel for the venv's Python 3.14 and conflicts with requirements.txt's pyarrow==26.0.0 (pip: ResolutionImpossible).
+# Its seed of paimon.sales.orders was measured to write and read back with pyarrow 26. Its runtime dependencies
+# are pinned in requirements.txt.
+pypaimon==2.1.0

@@ -5,8 +5,8 @@ policies of ice.sales.orders: alice reads all, bob and mallory get MASK_NULL on 
 region = 'us', eve nothing. C1 to C16 (docs/en/specs/2026-11-09-starrocks-unmeasured-paths-probe-design.md,
 probe 2) run once per catalog, as one ProbeCheck list each.
 
-Catalogs: jdbc (Postgres) and hive (Hive Metastore, data on RustFS). Paimon is task 4: it adds a Catalog to
-CATALOGS; until then its probe prints one ERROR line unless PROBE_SKIP names it.
+Catalogs: jdbc (Postgres), hive (Hive Metastore, data on RustFS) and paimon (a filesystem warehouse on RustFS,
+written by pypaimon). On paimon, C14 reads the Paimon system tables orders$files, $snapshots and $partitions (H7).
 """
 import dataclasses
 import functools
@@ -44,6 +44,10 @@ class Catalog:
     # C14: (sql, name) candidates for a partition listing, tried in order as alice; empty: not applicable.
     partition_listings: tuple[tuple[str, str], ...] = ()
     c14_na: str = ""                 # the reason C14 does not apply, when partition_listings is empty
+    # C14 on Paimon (H7): the system tables of orders. The first is the sight: alice reads it non-empty.
+    system_tables: tuple[str, ...] = ()
+    # C16 for a catalog other than jdbc: the properties of eve's (and root's sight) CREATE EXTERNAL CATALOG.
+    c16_properties: str = ""
 
 
 CATALOGS = [
@@ -55,7 +59,13 @@ CATALOGS = [
          "information_schema.partitions_meta"),
         ("SELECT * FROM hive.information_schema.partitions_meta WHERE DB_NAME = 'sales' AND TABLE_NAME = 'orders'",
          "hive.information_schema.partitions_meta"),
-    )),
+    ), c16_properties='"type" = "hive", "hive.metastore.uris" = "thrift://hive-metastore:9083"'),
+    # pypaimon writes (id, region, email) partitioned by region; Paimon keeps the declared column order.
+    Catalog("paimon", Probe.PAIMON, "e2esecret", "paimon.catalog.warehouse", (0, 1, 2),
+            system_tables=("files", "snapshots", "partitions"),
+            c16_properties='"type" = "paimon", "paimon.catalog.type" = "filesystem", '
+                           '"paimon.catalog.warehouse" = "s3://warehouse/paimon/", '
+                           '"aws.s3.endpoint" = "http://s3:9000", "aws.s3.enable_path_style_access" = "true"'),
 ]
 
 
@@ -146,6 +156,8 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
         return None, None, "; ".join(errors)
 
     def c14_na():
+        if c.system_tables:
+            return None
         if not c.partition_listings:
             return c.c14_na
         sql, _, errors = c14_listing()
@@ -163,6 +175,31 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
         sql, _, _ = c14_listing()
         r = text("alice", sql)
         return isinstance(r, list) and any("eu" in str(v) for row in r for v in row)
+
+    # C14 on Paimon (H7): alice reads orders$files; bob or eve reading any row of any system table is the leak.
+    def system_table(user, name):
+        return text(user, f"SELECT * FROM {c.name}.sales.`orders${name}`")
+
+    def c14_system_sight():
+        r = system_table("alice", c.system_tables[0])
+        return isinstance(r, list) and len(r) > 0
+
+    def c14_system_actual():
+        """Per user, each table's row count ("+eu" when a row names eu) or refusal, short enough for one line."""
+        raw = {(user, name): system_table(user, name) for user in ("bob", "eve") for name in c.system_tables}
+        failed = first_failure(raw)
+        if failed is not raw:
+            return failed
+
+        def shown(r):
+            if not isinstance(r, list):
+                return str(r)
+            return f"{len(r)}" + ("+eu" if any("eu" in str(v) for row in r for v in row) else "")
+        return {user: ", ".join(f"{name} {shown(raw[user, name])}" for name in c.system_tables)
+                for user in ("bob", "eve")} | {"rows": {k: len(v) for k, v in raw.items() if isinstance(v, list)}}
+
+    def c14_system_leaked(r):
+        return any(n > 0 for n in r["rows"].values())
 
     # C15: root's CREATE EXTERNAL CATALOG <name> in the audit table (when the image loads one) and fe.audit.log.
     create_stmt = f"CREATE EXTERNAL CATALOG {c.name} "
@@ -241,21 +278,20 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
             return r["eve"] != DENIED or bool(r["canary hits"])
         c16_name = "eve CREATE EXTERNAL CATALOG (JDBC, canary driver_url)"
     else:
-        def hive_catalog(name):
-            return (f'CREATE EXTERNAL CATALOG {name} PROPERTIES ("type" = "hive", '
-                    '"hive.metastore.uris" = "thrift://hive-metastore:9083")')
+        def other_catalog(name):
+            return f"CREATE EXTERNAL CATALOG {name} PROPERTIES ({c.c16_properties})"
 
         def c16_sight():
-            r = text("root", hive_catalog(f"c16h_sight_{RUN_ID}"))
-            text("root", f"DROP CATALOG IF EXISTS c16h_sight_{RUN_ID}")
+            r = text("root", other_catalog(f"c16_{c.name}_sight_{RUN_ID}"))
+            text("root", f"DROP CATALOG IF EXISTS c16_{c.name}_sight_{RUN_ID}")
             return r == []
 
         def c16_actual():
-            return {"eve": text("eve", hive_catalog(f"c16h_eve_{RUN_ID}"))}
+            return {"eve": text("eve", other_catalog(f"c16_{c.name}_eve_{RUN_ID}"))}
 
         def c16_leaked(r):
             return r["eve"] != DENIED
-        c16_name = "eve CREATE EXTERNAL CATALOG (Hive)"
+        c16_name = f"eve CREATE EXTERNAL CATALOG ({c.name})"
 
     def show_create_sight():
         """Root's SHOW CREATE CATALOG prints the properties: a secret printed in the clear would be seen."""
@@ -298,18 +334,12 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
                                       "REFRESH MANUAL PROPERTIES ('replication_num' = '1') "
                                       f"AS SELECT id, region, email FROM {t}"),
               not_denied),
+        check("C14", "bob and eve read orders$files / $snapshots / $partitions (no row)", c14_system_sight,
+              c14_system_actual, c14_system_leaked) if c.system_tables else
         check("C14", "bob partition listing (no eu)", c14_sight, c14_actual, c14_leaked, c14_na),
         check("C15", "audit table and fe.audit.log: no secret", c15_sight, c15_actual, c15_leaked),
         check("C16", c16_name, c16_sight, c16_actual, c16_leaked),
     ]
-
-
-def paimon_hook() -> list[ProbeCheck]:
-    """Task 4 replaces this with a Catalog in CATALOGS. Until then a run that does not skip paimon fails loudly."""
-    def not_yet():
-        raise NotImplementedError("the Paimon catalog checks are task 4")
-    return [ProbeCheck(id="C0-paimon", probe=Probe.PAIMON, name="Paimon catalog checks", sight=lambda: True,
-                       actual=not_yet, leaked=lambda r: False)]
 
 
 def main():
@@ -317,7 +347,6 @@ def main():
     checks: list[ProbeCheck] = []
     for c in CATALOGS:
         checks += checks_for(c)
-    checks += paimon_hook()
     sys.exit(run_checks(checks, skipped))
 
 

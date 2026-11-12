@@ -208,10 +208,39 @@ SQL
     echo "seeded hive.sales.orders"
 }
 
-# Each probe's seed: later tasks fill these in (paimon: task 4; loads: task 5).
+# StarRocks 4.1.7 cannot create a Paimon table, so pypaimon (requirements-paimon.txt) writes sales.orders into the
+# filesystem warehouse on RustFS from the host: the rows of ORDERS_ALL in one commit, (id, region, email)
+# partitioned by region. The catalog then reads it with the RustFS keys; its CREATE is one line, as jdbc's.
+seed_paimon() {
+    "$PY" -I - "$S3_PORT" <<'EOF'
+import sys
+import pyarrow as pa
+from pypaimon import CatalogFactory, Schema
+catalog = CatalogFactory.create({
+    "warehouse": "s3://warehouse/paimon/", "s3.endpoint": f"http://127.0.0.1:{sys.argv[1]}",
+    "s3.access-key": "e2e", "s3.secret-key": "e2esecret", "s3.region": "us-east-1", "s3.path-style-access": "true"})
+catalog.create_database("sales", False)
+schema = pa.schema([("id", pa.int64()), ("region", pa.string()), ("email", pa.string())])
+catalog.create_table("sales.orders", Schema.from_pyarrow_schema(schema, partition_keys=["region"]), False)
+builder = catalog.get_table("sales.orders").new_batch_write_builder()
+write, commit = builder.new_write(), builder.new_commit()
+write.write_arrow(pa.Table.from_pylist([
+    {"id": 1, "region": "us", "email": "a@x.io"}, {"id": 2, "region": "eu", "email": "b@x.io"},
+    {"id": 3, "region": "us", "email": "c@x.io"}, {"id": 4, "region": "eu", "email": "d@x.io"}], schema=schema))
+commit.commit(write.prepare_commit())
+write.close()
+commit.close()
+EOF
+    root -e "CREATE EXTERNAL CATALOG paimon PROPERTIES (\"type\" = \"paimon\", \"paimon.catalog.type\" = \"filesystem\", \"paimon.catalog.warehouse\" = \"s3://warehouse/paimon/\", \"aws.s3.endpoint\" = \"http://s3:9000\", \"aws.s3.enable_path_style_access\" = \"true\", \"aws.s3.access_key\" = \"e2e\", \"aws.s3.secret_key\" = \"e2esecret\", \"aws.s3.region\" = \"us-east-1\")"
+    root -N -e 'SELECT count(*) FROM paimon.sales.orders' | grep -qx 4 || { echo "paimon.sales.orders: not 4 rows" >&2; exit 1; }
+    echo "seeded paimon.sales.orders"
+}
+
+# Each probe's seed: later tasks fill these in (loads: task 5).
 seed_catalogs() {
     if ! skipped jdbc; then seed_jdbc; fi
     if ! skipped hive; then seed_hive; fi
+    if ! skipped paimon; then seed_paimon; fi
 }
 seed_loads() { :; }
 seed_in_namespace() { :; }
