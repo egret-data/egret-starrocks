@@ -304,11 +304,50 @@ seed_in_namespace
 status=0
 : > "$WORK/probe.out"
 
-# in-namespace runs INSIDE a throwaway container on the probe network, with no credentials: Task 6 extends
-# the arguments after <run_id> (the FE and BE ports, the canary) and its own checks.
+# in-namespace runs INSIDE a throwaway container on the probe network, with no credentials (M5). It reaches
+# the StarRocks container by name on $NET, on the container-internal ports. probe.sh finds, as root, the two
+# facts a credential-less peer cannot: a segment file of demo.customers (SHOW TABLET + find) with its sha256
+# (N5's sight), and the S4 load label confirmed in be.INFO (N3's sight). No inns check depends on loader's
+# INSERT grant, so it is sound to run after revoke_loader has served policy version 2 (loader's INSERT gone):
+# N5 reads a root-seeded table's file, N3 greps a label already loaded before the revoke, N8 calls getDbNames.
+BE_STORAGE_DEFAULT=/data/deploy/starrocks/be/storage
+BE_INFO=/data/deploy/starrocks/be/log/be.INFO
+INNS_SEG_PATH="" INNS_SEG_SHA="" INNS_N3_PATTERN="" INNS_N3_SIGHT=no
+
+inns_discover() {
+    INNS_SEG_PATH="" INNS_SEG_SHA="" INNS_N3_PATTERN="" INNS_N3_SIGHT=no
+    local tabletid storage
+    tabletid=$(root -N -e 'SHOW TABLET FROM demo.customers' 2>/dev/null | awk 'NR==1{print $1}')
+    storage=$(awk -F= '/^[[:space:]]*storage_root_path[[:space:]]*=/{v=$2} END{print v}' "$WORK/be.conf")
+    storage=${storage%%,*}; storage=${storage%%;*}; storage=$(printf '%s' "$storage" | tr -d ' ')
+    [ -n "$storage" ] || storage=$BE_STORAGE_DEFAULT
+    storage=${storage/\$\{STARROCKS_HOME\}//data/deploy/starrocks/be}
+    if [ -n "$tabletid" ]; then
+        INNS_SEG_PATH=$(docker exec "$NAME-sr" sh -c "find '$storage' -type f -path '*/$tabletid/*' -name '*.dat' 2>/dev/null | head -1")
+        [ -n "$INNS_SEG_PATH" ] || INNS_SEG_PATH=$(docker exec "$NAME-sr" sh -c "find '$storage' -type f -path '*/$tabletid/*' 2>/dev/null | head -1")
+    fi
+    [ -n "$INNS_SEG_PATH" ] && INNS_SEG_SHA=$(docker exec "$NAME-sr" sh -c "sha256sum '$INNS_SEG_PATH' 2>/dev/null" | awk '{print $1}')
+    echo "inns N5 segment: tablet ${tabletid:-none}, path ${INNS_SEG_PATH:-none}, sha256 ${INNS_SEG_SHA:-none}"
+    # N3: prefer the S4 load label (proves a recent real load leaks); else a token the BE always logs.
+    if docker exec "$NAME-sr" sh -c "grep -q 'S4-$RUN_ID' '$BE_INFO' 2>/dev/null"; then
+        INNS_N3_PATTERN="S4-$RUN_ID" INNS_N3_SIGHT=ok
+    elif docker exec "$NAME-sr" sh -c "grep -q 'StarRocks' '$BE_INFO' 2>/dev/null"; then
+        INNS_N3_PATTERN=StarRocks INNS_N3_SIGHT=ok
+    fi
+    echo "inns N3 pattern: ${INNS_N3_PATTERN:-none} (sight $INNS_N3_SIGHT)"
+}
+
 inns_phase() {
+    inns_discover
+    local extra=()
+    [ "${BE_HTTP_AUTH:-0}" = 1 ] && extra+=(--auth eve:evepw)
+    # INNS_EXTRA lets a hand-run pass --no-destructive (Task 7 on kind) or --mutant-n8-root (the N8 mutant).
+    # shellcheck disable=SC2206
+    [ -n "${INNS_EXTRA:-}" ] && extra+=($INNS_EXTRA)
     docker run --rm --network "$NET" -v "$HERE:/e2e:ro" "$PYTHON_IMAGE" \
-        python -I /e2e/inns_checks.py "$NAME-sr" "$RUN_ID"
+        python -I /e2e/inns_checks.py "$NAME-sr" "$RUN_ID" \
+        "${INNS_SEG_PATH:-}" "${INNS_SEG_SHA:-}" "${INNS_N3_PATTERN:-}" \
+        --n3-sight "$INNS_N3_SIGHT" ${extra[@]+"${extra[@]}"}
 }
 
 # run_group <file> <runner: host|inns> <probe names of the group...>
@@ -360,7 +399,12 @@ if ! skipped routine-load && [ -f "$HERE/probe_loads.py" ]; then
         LOADS_PHASE=after run_group probe_loads.py host routine-load
     fi
 fi
+# The in-namespace group is last: N11 (/api/_stop_be) runs last of all and, with the default config, stops
+# the BE. There is no later phase to run; only the combined summary below, which reads probe.out, follows.
 run_group inns_checks.py inns in-namespace
+if ! skipped in-namespace; then
+    echo "inns done: N11 was the last destructive check (it may have stopped the BE); no later phase runs"
+fi
 
 echo
 echo "combined verdicts"
