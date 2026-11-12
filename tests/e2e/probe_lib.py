@@ -51,6 +51,18 @@ class ProbeCheck:
     na_reason: Callable[[], "str | None"] = lambda: None
 
 
+# sqlpaths' DENIED codes (5203, 5204, 5210-5214): sqlpaths.run() turns them into the string "DENIED", the
+# normal refusal result. Any other "ERROR ..." string it returns is a failed request, not a result.
+DENIED_CODES = (5203, 5204, 5210, 5211, 5212, 5213, 5214)
+
+
+def _is_request_failure(actual: object) -> bool:
+    """sqlpaths helpers never raise: a failure comes back as "ERROR <errno or class>: <message>"."""
+    if not isinstance(actual, str) or not actual.startswith("ERROR "):
+        return False
+    return not any(actual.startswith(f"ERROR {code}") for code in DENIED_CODES)
+
+
 def _evaluate(c: ProbeCheck, skipped: set[Probe]) -> tuple[Verdict, object]:
     if c.probe in skipped:
         return Verdict.SKIP, f"PROBE_SKIP={c.probe.value}"
@@ -61,6 +73,8 @@ def _evaluate(c: ProbeCheck, skipped: set[Probe]) -> tuple[Verdict, object]:
         if not c.sight():
             return Verdict.BLIND, "the sight control failed: a refusal here proves nothing"
         actual = c.actual()
+        if _is_request_failure(actual):
+            return Verdict.ERROR, actual
         return (Verdict.LEAK if c.leaked(actual) else Verdict.ENFORCED), actual
     except Exception as e:  # a broken check must report, not stop the run
         return Verdict.ERROR, f"{type(e).__name__}: {e}"

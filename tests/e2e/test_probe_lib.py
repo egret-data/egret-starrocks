@@ -1,4 +1,4 @@
-"""Unit tests of probe_lib: python -I -m unittest tests/e2e/test_probe_lib.py (no Docker needed)."""
+"""Unit tests of probe_lib: python -I -m unittest discover -s tests/e2e -p test_probe_lib.py (no Docker needed)."""
 import contextlib
 import io
 import os
@@ -95,6 +95,32 @@ class RunChecks(unittest.TestCase):
             raise ValueError("x")
         _, out = run([check(actual=boom, id="A"), check(id="B")])
         self.assertEqual([l.split()[0] for l in out.splitlines()[:2]], ["ERROR", "ENFORCED"])
+
+    def test_connection_failure_string_is_error_not_leak_or_enforced(self):
+        # sqlpaths helpers never raise: a failure comes back as "ERROR <errno>: <msg>" or "ERROR <Class>: <msg>".
+        for failure in ("ERROR 2003: Can't connect to MySQL server", "ERROR OSError: refused"):
+            for leaked in (lambda r: True, lambda r: False):
+                status, out = run([check(actual=lambda f=failure: f, leaked=leaked)])
+                self.assertTrue(out.startswith("ERROR  "), out)
+                self.assertIn(failure[:20], out)
+                self.assertEqual(status, 1)
+
+    def test_error_string_does_not_hide_behind_a_sight_failure(self):
+        self.assertTrue(self.verdict_line([check(sight=lambda: False, actual=lambda: "ERROR 2003: x")]).startswith("BLIND"))
+
+    def test_denied_refusal_takes_the_normal_path(self):
+        # run() maps privilege errors (5203, 5204, 5210-5214, "Access denied") to the string DENIED ...
+        self.assertTrue(self.verdict_line([check(actual=lambda: "DENIED")]).startswith("ENFORCED"))
+        self.assertTrue(self.verdict_line([check(actual=lambda: "DENIED", leaked=lambda r: True)]).startswith("LEAK"))
+        # ... and a refusal that arrives as an ERROR string with one of those codes is not a harness fault either.
+        for code in (5203, 5204, 5210, 5211, 5212, 5213, 5214):
+            line = self.verdict_line([check(actual=lambda c=code: f"ERROR {c}: Access denied", leaked=lambda r: False)])
+            self.assertTrue(line.startswith("ENFORCED"), line)
+
+    def test_other_non_error_strings_and_5xxx_errors(self):
+        # Any other "ERROR ..." string (here a 5xxx storage error, not a DENIED code) is a failed request: ERROR.
+        self.assertTrue(self.verdict_line([check(actual=lambda: "ERROR 5001: storage", leaked=lambda r: False)]).startswith("ERROR"))
+        self.assertTrue(self.verdict_line([check(actual=lambda: "an ERROR inside", leaked=lambda r: False)]).startswith("ENFORCED"))
 
     def test_result_is_cut_at_110_characters(self):
         line = self.verdict_line([check(actual=lambda: "x" * 300)])

@@ -127,7 +127,11 @@ if [ "${BE_HTTP_AUTH:-0}" = 1 ]; then
     printf 'enable_http_auth = true\n' >> "$WORK/be.conf"
 fi
 if [ "${UDF_JAVA_POLICY:-0}" = 1 ]; then
-    sed -i.bak 's#^JAVA_OPTS="#JAVA_OPTS="-Djava.security.policy=/opt/egret-probe/deny-all.policy #' "$WORK/be.conf"
+    # -Djava.security.policy does nothing unless a SecurityManager is installed, hence -Djava.security.manager
+    # (JDK 17 accepts it with a deprecation warning; on JDK 18+ it would need =allow, and a JVM that refuses it
+    # fails to start the BE, which the variant run records). The JDK of the allin1 images is the upstream
+    # starrocks/allin1-ubuntu base's: unknown from docker/allin1.Dockerfile without running a container.
+    sed -i.bak 's#^JAVA_OPTS="#JAVA_OPTS="-Djava.security.manager -Djava.security.policy=/opt/egret-probe/deny-all.policy #' "$WORK/be.conf"
     grep -q 'java.security.policy' "$WORK/be.conf" || { echo "UDF_JAVA_POLICY=1: be.conf has no JAVA_OPTS line to edit" >&2; exit 1; }
 fi
 stack_starrocks
@@ -151,17 +155,44 @@ seed_catalogs
 seed_loads
 seed_in_namespace
 
-# The probe files, in order. A file that a later task has not written yet is named, not silently passed over.
+# The probe files, in order udf, catalogs, loads, in-namespace. A group whose probes are all in PROBE_SKIP is
+# not run; a missing file of a group that is run is an ERROR line (the summary counts it) and fails the run.
+RUN_ID=$(date +%s)
 status=0
 : > "$WORK/probe.out"
-for f in udf_checks catalog_checks load_checks inns_checks; do
-    if [ ! -f "$HERE/$f.py" ]; then
-        echo "not written yet: $f.py" | tee -a "$WORK/probe.out"
-        continue
+
+# in-namespace runs INSIDE a throwaway container on the probe network, with no credentials: Task 6 extends
+# the arguments after <run_id> (the FE and BE ports, the canary) and its own checks.
+inns_phase() {
+    docker run --rm --network "$NET" -v "$HERE:/e2e:ro" "$PYTHON_IMAGE" \
+        python -I /e2e/inns_checks.py "$NAME-sr" "$RUN_ID"
+}
+
+# run_group <file> <runner: host|inns> <probe names of the group...>
+run_group() {
+    local file=$1 runner=$2 first="" p
+    shift 2
+    for p in "$@"; do
+        if ! skipped "$p"; then first=$p; break; fi
+    done
+    [ -n "$first" ] || return 0
+    if [ ! -f "$HERE/$file" ]; then
+        echo "ERROR  [probe:$first]  $file probe file missing" | tee -a "$WORK/probe.out"
+        status=1
+        return 0
     fi
-    echo "$f start $(date -u +%T)"
-    "$PY" -I "$HERE/$f.py" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" "$BE_HTTP_PORT" "$CANARY_LOG" 2>&1 | tee -a "$WORK/probe.out" || status=1
-done
+    echo "$file start $(date -u +%T)"
+    if [ "$runner" = inns ]; then
+        inns_phase 2>&1 | tee -a "$WORK/probe.out" || status=1
+    else
+        "$PY" -I "$HERE/$file" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" "$BE_HTTP_PORT" "$CANARY_LOG" 2>&1 \
+            | tee -a "$WORK/probe.out" || status=1
+    fi
+}
+run_group probe_udf.py host udf python-udf
+run_group probe_catalogs.py host hive jdbc paimon
+run_group probe_loads.py host stream-load routine-load
+run_group inns_checks.py inns in-namespace
 
 echo
 echo "combined verdicts"
