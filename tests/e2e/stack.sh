@@ -150,13 +150,23 @@ stack_auditloader() {
     fi
 }
 
+# stack_wait_policies [version [after]]: wait (60 s) until the plugin asks with lastKnownVersion=<version>
+# (default 1), on a ranger.log line after the first <after> lines (default 0: the whole log). A caller that
+# publishes a new version passes the log's line count from before the publish, so an older line cannot match.
 stack_wait_policies() {
-    echo "waiting for the Ranger plugin to load the policies"
+    local version=${1:-1} after=${2:-0}
+    echo "waiting for the Ranger plugin to load the policies (version $version)"
     for _ in $(seq 1 30); do
-        grep -q 'lastKnownVersion=1' "$WORK/ranger.log" 2>/dev/null && break
+        stack_policy_seen "$version" "$after" && break
         sleep 2
     done
-    grep -q 'lastKnownVersion=1' "$WORK/ranger.log" || { echo "plugin never loaded policy version 1" >&2; exit 1; }
+    stack_policy_seen "$version" "$after" || { echo "plugin never loaded policy version $version" >&2; exit 1; }
+}
+
+# One awk over the file, not tail | grep -q: under pipefail an early grep exit can fail the pipeline.
+stack_policy_seen() {
+    awk -v v="$1" -v after="$2" 'NR > after && $0 ~ ("lastKnownVersion=" v "([^0-9]|$)") { found = 1 }
+        END { exit !found }' "$WORK/ranger.log" 2>/dev/null
 }
 
 stack_wait_tags() {

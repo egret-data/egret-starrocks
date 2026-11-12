@@ -27,6 +27,7 @@ With no flag the output is exactly what run.sh's checks expect. The probe flags 
 --revoke loader  leave out loader's INSERT items (needs --probe; the row filter stays).
 """
 import json
+import os
 import sys
 
 ACCESS = [{"type": "select", "isAllowed": True}]
@@ -171,11 +172,22 @@ service_def["contextEnrichers"] = [{
     "enricherOptions": {"tagRetrieverClassName": "org.apache.ranger.plugin.contextenricher.RangerAdminTagRetriever",
                         "tagRefresherPollingInterval": "10000"}}]
 tag_def = json.load(open(TAG_DEF))
-json.dump({"serviceName": "e2e", "serviceId": 1, "policyVersion": POLICY_VERSION, "serviceDef": service_def,
-           "policies": policies, "auditMode": "audit-default",
-           "tagPolicies": {"serviceName": "e2e_tag", "serviceId": 2, "policyVersion": 1, "serviceDef": tag_def,
-                           "policies": tag_policies, "auditMode": "audit-default"}},
-          open(POLICIES_OUT, "w"))
-json.dump(service_tags, open(TAGS_OUT, "w"))
+
+
+def write_atomically(path, document):
+    """fakeranger.py reads the files on every request, also while a run publishes a new version: write a
+    temporary file in the same directory and rename it over the served one, so a reader never sees half a file."""
+    tmp = os.path.join(os.path.dirname(os.path.abspath(path)), f".{os.path.basename(path)}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(document, f)
+    os.replace(tmp, path)
+
+
+write_atomically(POLICIES_OUT, {
+    "serviceName": "e2e", "serviceId": 1, "policyVersion": POLICY_VERSION, "serviceDef": service_def,
+    "policies": policies, "auditMode": "audit-default",
+    "tagPolicies": {"serviceName": "e2e_tag", "serviceId": 2, "policyVersion": 1, "serviceDef": tag_def,
+                    "policies": tag_policies, "auditMode": "audit-default"}})
+write_atomically(TAGS_OUT, service_tags)
 print(f"wrote {len(policies)} policies, {len(tag_policies)} tag policies to {POLICIES_OUT}, "
       f"{len(TAGGED)} tag attachments to {TAGS_OUT}")
