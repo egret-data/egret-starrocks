@@ -17,7 +17,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # python -I does not put the script's directory on the path
 import sqlpaths  # noqa: E402
-from probe_lib import DENIED_CODES, Probe, ProbeCheck, canary_hits, run_checks, skipped_probes  # noqa: E402
+from probe_lib import (DENIED_CODES, PAIMON_SYSTEM_COLUMNS, Probe, ProbeCheck, canary_hits,  # noqa: E402
+                       paimon_system_leak, run_checks, skipped_probes)
 from sqlpaths import DENIED, binary, flight, http, text  # noqa: E402
 
 sqlpaths.configure(sys.argv[1], sys.argv[2], sys.argv[3])
@@ -176,30 +177,30 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
         r = text("alice", sql)
         return isinstance(r, list) and any("eu" in str(v) for row in r for v in row)
 
-    # C14 on Paimon (H7): alice reads orders$files; bob or eve reading any row of any system table is the leak.
+    # C14 on Paimon (H7): alice reads every system table, eu included (the sight); bob or eve reading the eu
+    # partition, or more records than bob's 2 rows (eve: 0), is the leak. A patch that applies bob's row filter
+    # to the system tables would read ENFORCED.
     def system_table(user, name):
-        return text(user, f"SELECT * FROM {c.name}.sales.`orders${name}`")
+        return text(user, f"SELECT {PAIMON_SYSTEM_COLUMNS[name]} FROM {c.name}.sales.`orders${name}`")
 
     def c14_system_sight():
-        r = system_table("alice", c.system_tables[0])
-        return isinstance(r, list) and len(r) > 0
+        r = {name: system_table("alice", name) for name in c.system_tables}
+        return (all(isinstance(v, list) and len(v) > 0 for v in r.values())
+                and any(row[0] == "{eu}" for row in r["files"]))
+
+    allowed = {"bob": len(ORDERS_BOB), "eve": 0}
 
     def c14_system_actual():
-        """Per user, each table's row count ("+eu" when a row names eu) or refusal, short enough for one line."""
-        raw = {(user, name): system_table(user, name) for user in ("bob", "eve") for name in c.system_tables}
-        failed = first_failure(raw)
-        if failed is not raw:
-            return failed
-
-        def shown(r):
-            if not isinstance(r, list):
-                return str(r)
-            return f"{len(r)}" + ("+eu" if any("eu" in str(v) for row in r for v in row) else "")
-        return {user: ", ".join(f"{name} {shown(raw[user, name])}" for name in c.system_tables)
-                for user in ("bob", "eve")} | {"rows": {k: len(v) for k, v in raw.items() if isinstance(v, list)}}
+        """Per user, each table's (partition, count) rows or refusal; a failed read is the check's ERROR."""
+        raw = {user: {name: system_table(user, name) for name in c.system_tables} for user in allowed}
+        for tables in raw.values():
+            failed = first_failure(tables)
+            if failed is not tables:
+                return failed
+        return raw
 
     def c14_system_leaked(r):
-        return any(n > 0 for n in r["rows"].values())
+        return any(paimon_system_leak(r[user], n) for user, n in allowed.items())
 
     # C15: root's CREATE EXTERNAL CATALOG <name> in the audit table (when the image loads one) and fe.audit.log.
     create_stmt = f"CREATE EXTERNAL CATALOG {c.name} "
@@ -334,7 +335,8 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
                                       "REFRESH MANUAL PROPERTIES ('replication_num' = '1') "
                                       f"AS SELECT id, region, email FROM {t}"),
               not_denied),
-        check("C14", "bob and eve read orders$files / $snapshots / $partitions (no row)", c14_system_sight,
+        check("C14", "bob and eve read orders$files / $snapshots / $partitions (no eu, no more than bob's rows)",
+              c14_system_sight,
               c14_system_actual, c14_system_leaked) if c.system_tables else
         check("C14", "bob partition listing (no eu)", c14_sight, c14_actual, c14_leaked, c14_na),
         check("C15", "audit table and fe.audit.log: no secret", c15_sight, c15_actual, c15_leaked),

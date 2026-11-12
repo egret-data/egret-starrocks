@@ -169,5 +169,37 @@ class CanaryHits(unittest.TestCase):
         self.assertEqual(canary_hits("/nonexistent/canary.log", "x"), [])
 
 
+
+class PaimonSystemLeak(unittest.TestCase):
+    """C14-paimon's predicate, over rows shaped as the probe reads them: (partition, record count)."""
+
+    # What bob read on both images in the 2026-11-12 runs.
+    BOB_UNFILTERED = {"files": [("{eu}", 2), ("{us}", 2)], "snapshots": [(None, 4)],
+                      "partitions": [("{eu}", 2), ("{us}", 2)]}
+
+    def test_unfiltered_reads_leak(self):
+        # Arrange / Act / Assert
+        self.assertTrue(probe_lib.paimon_system_leak(self.BOB_UNFILTERED, allowed_rows=2))
+
+    def test_rows_filtered_to_us_do_not_leak(self):
+        # What a patch applying bob's row filter to the system tables would return (the "no eu" branch).
+        filtered = {"files": [("{us}", 2)], "snapshots": [(None, 2)], "partitions": [("{us}", 2)]}
+        self.assertFalse(probe_lib.paimon_system_leak(filtered, allowed_rows=2))
+
+    def test_refusals_and_empty_results_do_not_leak(self):
+        self.assertFalse(probe_lib.paimon_system_leak(
+            {"files": "DENIED", "snapshots": "DENIED", "partitions": []}, allowed_rows=0))
+
+    def test_eu_matches_the_partition_value_not_a_substring(self):
+        self.assertFalse(probe_lib.paimon_system_leak({"files": [("{us-eu-x}", 1)]}, allowed_rows=2))
+        self.assertTrue(probe_lib.paimon_system_leak({"partitions": [("{eu}", 0)]}, allowed_rows=2))
+
+    def test_record_counts_beyond_the_allowed_rows_leak(self):
+        self.assertTrue(probe_lib.paimon_system_leak({"snapshots": [(None, 4)]}, allowed_rows=2))
+        self.assertTrue(probe_lib.paimon_system_leak({"files": [("{us}", 2), ("{us}", 1)]}, allowed_rows=2))
+        self.assertTrue(probe_lib.paimon_system_leak({"files": [("{us}", 1)]}, allowed_rows=0))
+        self.assertFalse(probe_lib.paimon_system_leak({"snapshots": [(None, 1), (None, 2)]}, allowed_rows=2))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -102,3 +102,27 @@ def canary_hits(log: str, marker: str) -> list[str]:
             return [line.rstrip("\n") for line in f if marker in line]
     except FileNotFoundError:
         return []
+
+
+# C14 on Paimon (H7): the columns read from each system table of orders, as (partition, record count) rows.
+PAIMON_SYSTEM_COLUMNS = {
+    "files": "`partition`, record_count",
+    "snapshots": "NULL, total_record_count",
+    "partitions": "`partition`, record_count",
+}
+
+
+def paimon_system_leak(tables: dict[str, object], allowed_rows: int, refused_partition: str = "{eu}") -> bool:
+    """One user's reads of the Paimon system tables carry what the policies refuse: a row of the refused
+    partition (by the partition column's value, not a substring: paths and UUIDs can hold "eu"), or more
+    records than the user may read (the sum over files or partitions, any snapshot's total). A refusal or an
+    empty result carries nothing."""
+    for name, rows in tables.items():
+        if not isinstance(rows, list) or not rows:
+            continue
+        if any(row[0] == refused_partition for row in rows):
+            return True
+        counts = [row[1] or 0 for row in rows]
+        if (max(counts) if name == "snapshots" else sum(counts)) > allowed_rows:
+            return True
+    return False
