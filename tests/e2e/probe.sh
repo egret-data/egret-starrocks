@@ -132,6 +132,8 @@ wait_hive_metastore() {
 }
 
 # Kafka in KRaft mode with a PLAINTEXT listener (9092) and a SASL_PLAINTEXT one (9093, PLAIN, user probe).
+# The image's configure script stops unless KAFKA_OPTS is set when a SASL listener is advertised; the JAAS
+# config is the listener's own property, so KAFKA_OPTS carries only a harmless property.
 start_kafka() {
     docker run -d --name "$NAME-kafka" --network "$NET" --network-alias kafka \
         -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
@@ -140,9 +142,33 @@ start_kafka() {
         -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT \
         -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9094 -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
         -e KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT -e KAFKA_SASL_ENABLED_MECHANISMS=PLAIN \
-        -e 'KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required user_probe="probepw";' \
+        -e 'KAFKA_LISTENER_NAME_SASL__PLAINTEXT_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required user_probe="kafkasecret";' \
         -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
-        -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 "$KAFKA_IMAGE" >/dev/null
+        -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 -e KAFKA_OPTS=-Degret.probe=1 "$KAFKA_IMAGE" >/dev/null
+}
+
+KAFKA_BIN=/opt/kafka/bin
+KAFKA_TOPIC=probe-r
+
+# The broker answers on both listeners and the SASL user logs in, or the routine-load checks would read a broker
+# that is not there as "no rows": a hard failure. Called by seed_loads, which then creates the topic.
+wait_kafka() {
+    docker exec "$NAME-kafka" sh -c 'printf "%s\n" "security.protocol=SASL_PLAINTEXT" "sasl.mechanism=PLAIN" \
+        "sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"probe\" password=\"kafkasecret\";" \
+        > /tmp/sasl.properties'
+    for _ in $(seq 1 60); do
+        if docker exec "$NAME-kafka" "$KAFKA_BIN/kafka-broker-api-versions.sh" --bootstrap-server kafka:9092 >/dev/null 2>&1 \
+            && docker exec "$NAME-kafka" "$KAFKA_BIN/kafka-broker-api-versions.sh" --bootstrap-server kafka:9093 \
+                --command-config /tmp/sasl.properties >/dev/null 2>&1; then
+            echo "Kafka answers on PLAINTEXT 9092 and SASL_PLAINTEXT 9093 (user probe)"
+            return 0
+        fi
+        if docker ps -a --filter "name=$NAME-kafka" --format '{{.Status}}' | grep -q Exited; then break; fi
+        sleep 2
+    done
+    docker logs "$NAME-kafka" 2>&1 | tail -20
+    echo "Kafka never answered on both listeners with the SASL user" >&2
+    return 1
 }
 
 # A service starts only when a probe that needs it is not skipped. A missing service is an ERROR, not a skip.
@@ -242,7 +268,32 @@ seed_catalogs() {
     if ! skipped hive; then seed_hive; fi
     if ! skipped paimon; then seed_paimon; fi
 }
-seed_loads() { :; }
+# Probe 3's tables, and nat's native GRANT: under access_control = ranger root's GRANT may be refused; its
+# outcome is printed and handed to probe_loads.py (S6's N/A reason) through $NAT_GRANT_OUT.
+NAT_GRANT_OUT=$WORK/nat-grant.txt
+seed_loads() {
+    if skipped stream-load && skipped routine-load; then return 0; fi
+    root <<'SQL'
+CREATE TABLE demo.s_target (id BIGINT, v VARCHAR(64))
+    DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num' = '1');
+CREATE TABLE demo.r_target (id BIGINT, v VARCHAR(64))
+    DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num' = '1');
+CREATE TABLE demo.pk_target (id BIGINT, v VARCHAR(64))
+    PRIMARY KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num' = '1');
+INSERT INTO demo.pk_target VALUES (1, 'seed-1'), (2, 'seed-2'), (3, 'seed-3');
+SQL
+    if root -e 'GRANT INSERT ON demo.s_target TO nat' > "$NAT_GRANT_OUT" 2>&1; then
+        echo "OK" > "$NAT_GRANT_OUT"
+    fi
+    echo "root GRANT INSERT ON demo.s_target TO nat: $(tr '\n' ' ' < "$NAT_GRANT_OUT")"
+    if ! skipped routine-load; then
+        wait_kafka
+        docker exec "$NAME-kafka" "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server kafka:9092 --create \
+            --topic "$KAFKA_TOPIC" --partitions 1 --replication-factor 1 >/dev/null
+        echo "created Kafka topic $KAFKA_TOPIC"
+    fi
+    echo "seeded demo.s_target, r_target, pk_target"
+}
 seed_in_namespace() { :; }
 seed_catalogs
 seed_loads
@@ -278,12 +329,37 @@ run_group() {
     if [ "$runner" = inns ]; then
         inns_phase 2>&1 | tee -a "$WORK/probe.out" || status=1
     else
-        AUDITLOADER_LOADING=${AUDITLOADER_LOADING:-0} "$PY" -I "$HERE/$file" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" "$BE_HTTP_PORT" "$CANARY_LOG" "$RUN_ID" 2>&1 \
+        AUDITLOADER_LOADING=${AUDITLOADER_LOADING:-0} LOADS_PHASE=${LOADS_PHASE:-} "$PY" -I "$HERE/$file" "$SR_PORT" "$SR_HTTP_PORT" "$FE_FLIGHT_PORT" "$BE_HTTP_PORT" "$CANARY_LOG" "$RUN_ID" 2>&1 \
             | tee -a "$WORK/probe.out" || status=1
     fi
 }
 run_group probe_catalogs.py host hive jdbc paimon
-run_group probe_loads.py host stream-load routine-load
+# R7: the fake Ranger serves version 2 without loader's INSERT. The wait counts only ranger.log lines written
+# after the publish (version 1's lines are already there). A plugin that never loads it is an ERROR line.
+revoke_loader() {
+    local before
+    before=$(wc -l < "$WORK/ranger.log")
+    "$PY" -I "$HERE/policies.py" "$HERE/servicedef-starrocks.json" "$HERE/servicedef-tag.json" "$WORK/policies.json" \
+        "$WORK/tags.json" --probe --version 2 --revoke loader
+    if ( stack_wait_policies 2 "$before" ); then
+        echo "the plugin loaded policy version 2 (loader's INSERT revoked)"
+        return 0
+    fi
+    echo "ERROR  [probe:routine-load]  R7 revoke: the plugin never loaded policy version 2 within 60 s" | tee -a "$WORK/probe.out"
+    status=1
+    return 1
+}
+
+# probe_loads.py runs twice: LOADS_PHASE=before (S1-S11, R1-R6, R8, and R7's state before the revoke, kept in
+# LOADS_STATE), then revoke_loader, then LOADS_PHASE=after (R7). Routine load runs last: the revoke changes
+# loader's grants for anything after it.
+export LOADS_STATE=$WORK/loads-state.json NAT_GRANT_OUT
+LOADS_PHASE=before run_group probe_loads.py host stream-load routine-load
+if ! skipped routine-load && [ -f "$HERE/probe_loads.py" ]; then
+    if revoke_loader; then
+        LOADS_PHASE=after run_group probe_loads.py host routine-load
+    fi
+fi
 run_group inns_checks.py inns in-namespace
 
 echo
