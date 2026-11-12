@@ -24,6 +24,7 @@ until a StarRocks release contains it, any StarRocks with Iceberg catalogs is ex
 | `0007` | A materialized view's refresh reads its base tables without its user's masks and row filters and stores the result, so a user under both could create a materialized view over the table and read it all in the clear. Creating one over a table where such a policy applies to the creator is refused (error 5212), and a refresh stops once its user comes under one. Strict by design: the refusal does not look at which columns the view reads. | No upstream issue or fix yet. |
 | `0008` | `EXPLAIN COSTS` printed the optimizer's column statistics of every table a statement reads (minimum, maximum, null fraction, distinct count over all rows), so a user under a row filter read the range and cardinality of the rows it hides. It is now refused (error 5213) when a row access or column masking policy on such a table applies to the user; the other EXPLAIN levels print no column statistics and stay allowed. | No upstream issue or fix yet. |
 | `0009` | `BROKER LOAD`, `EXPORT`, `SELECT ... INTO OUTFILE` and `CREATE EXTERNAL TABLE ... ENGINE = file` accepted storage properties with no credentials of their own and then ran with the cluster's identity: an instance profile, the AWS default credential chain (which the S3 client uses whenever no keys are given), a web identity token, an Azure managed identity, a GCE service account, a keytab on the server, or the keys in be.conf. Any user, even one with no privilege, could write query results to any bucket that identity reaches. These statements now need OPERATE on SYSTEM (error 5214) unless every location is on an object store and the properties carry that store's own credentials and turn on no cluster-identity switch (the switches take precedence over keys). HDFS and local paths always need it. | No upstream issue or fix yet. |
+| `0010` | A Paimon system table (`orders$files`, `$snapshots`, `$partitions`, ...) is a separate table to Ranger, so the base table's row filter and column mask did not apply to it: a user under a row filter read every partition value, file path and per-column minimum/maximum, and the snapshot history, of the rows the filter hides (probe check C14-paimon, H7). It is now refused when a row access or column masking policy on the base table applies to the user; a user with no policy on it reads the system tables as before. | No upstream issue or fix yet. |
 
 Drop a patch when the upstream release in `UPSTREAM` contains it.
 
@@ -118,6 +119,12 @@ Result on 2026-11-09 (verdict counts; 0 `BLIND`, 0 `ERROR` in all three runs):
 The fork closes the catalog policy-rewrite family (C3–C13 on every connector) that leaks on the
 official image; `enable_http_auth` closes the anonymous BE-HTTP family (N2–N5, N11, S8-anon);
 eight leaks survive both and are tracked as follow-ups FU-1…FU-11 in the probe findings report.
+
+Result on 2026-11-12 against `4.1.7-egret.5` (patches `0001` to `0010`), catalog group only
+(`PROBE_SKIP=stream-load,routine-load,in-namespace`): 46 `ENFORCED`, 0 `LEAK`, 0 `BLIND`, 2 `N/A`,
+0 `ERROR`. `C14-paimon` is now `ENFORCED` (bob and eve are refused on `orders$files`, `$snapshots` and
+`$partitions`), so the catalog `LEAK` count drops by one from the `4.1.7-egret.4` run; the same group on the
+official `4.1.7` image still reads `C14-paimon` as `LEAK`. `run.sh` stays green (51/51 checks, 10/10 audit).
 The probe files that carry a confirmed leak are held on the `test/probe-unmeasured-paths` branch
 and are not published here until those follow-ups land.
 
