@@ -1,4 +1,5 @@
-"""Write what the fake Ranger serves: policies.py <servicedef.json> <tag-servicedef.json> <policies.json> <tags.json>.
+"""Write what the fake Ranger serves:
+policies.py <servicedef.json> <tag-servicedef.json> <policies.json> <tags.json> [--probe [--version N] [--revoke loader]]
 
 alice: SELECT everywhere, no mask or filter (control).
 bob:   SELECT everywhere, MASK_NULL on demo.customers.phone and ice.sales.orders.email,
@@ -17,11 +18,34 @@ mallory: bob's grant, mask and row filter on demo.customers, and she may create 
 root:  the orders row filter too. Root is still subject to row filters and masks, and Iceberg metadata
        collect jobs (plan_mode = distributed) read t$logical_iceberg_metadata as root, so this makes the
        "guard" check fail if patch 0001 ever stops exempting those jobs.
+
+With no flag the output is exactly what run.sh's checks expect. The probe flags (probe.sh) add:
+--probe        loader (INSERT on demo.s_target, r_target and pk_target, the row filter id = 1 on pk_target)
+               and, on hive, jdbc and paimon, the policies ice.sales.orders has: alice reads all, bob and
+               mallory get MASK_NULL on email and the row filter region = 'us', eve nothing.
+--version N    policyVersion N (the plugin reloads when it grows), for a run that revokes a grant.
+--revoke loader  leave out loader's INSERT items (needs --probe; the row filter stays).
 """
 import json
+import os
 import sys
 
 ACCESS = [{"type": "select", "isAllowed": True}]
+
+args = sys.argv[1:]
+PROBE = "--probe" in args
+
+
+def flag_value(name, default):
+    return args[args.index(name) + 1] if name in args else default
+
+
+POLICY_VERSION = int(flag_value("--version", 1))
+REVOKE = flag_value("--revoke", None)
+positional = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in ("--version", "--revoke"))]
+if len(positional) != 4 or (not PROBE and (POLICY_VERSION != 1 or REVOKE)) or REVOKE not in (None, "loader"):
+    sys.exit(__doc__)
+SERVICE_DEF, TAG_DEF, POLICIES_OUT, TAGS_OUT = positional
 
 
 def values(v):
@@ -81,6 +105,26 @@ policy("audit-loader", 0, res("default_catalog", "starrocks_audit_db__", "starro
 policy("impersonate", 0, {"user": values("*")},
        policyItems=[item(["svc"], accesses=[{"type": "impersonate", "isAllowed": True}])])
 
+if PROBE:
+    def grants(*types):
+        return [{"type": t, "isAllowed": True} for t in types]
+
+    policy("filter-pk-target", 2, res("default_catalog", "demo", "pk_target"),
+           rowFilterPolicyItems=[item(["loader"], rowFilterInfo={"filterExpr": "id = 1"})])
+    # The policies of ice.sales.orders, on the other catalogs. Not root's filter: that one exists for the
+    # Iceberg metadata collect jobs, which these connectors do not run.
+    for catalog in ("hive", "jdbc", "paimon"):
+        policy(f"grant-{catalog}", 0, res(catalog, "sales", "*", "*"), policyItems=[item(["alice", "bob", "mallory"])])
+        policy(f"mask-email-{catalog}", 1, res(catalog, "sales", "orders", "email"),
+               dataMaskPolicyItems=[item(["bob", "mallory"], dataMaskInfo={"dataMaskType": "MASK_NULL"})])
+        policy(f"filter-orders-{catalog}", 2, res(catalog, "sales", "orders"),
+               rowFilterPolicyItems=[item(["bob", "mallory"], rowFilterInfo={"filterExpr": "region = 'us'"})])
+    # Last, so that revoking them leaves every other policy id where it was.
+    for table in ("s_target", "r_target", "pk_target"):
+        if REVOKE != "loader":
+            policy(f"grant-loader-insert-{table}", 0, res("default_catalog", "demo", table),
+                   policyItems=[item(["loader"], accesses=grants("insert"))])
+
 # Tag policies (service e2e_tag, the tag service-def) and the tags they match.
 tag_policies = []
 
@@ -121,18 +165,29 @@ service_tags = {
     "resourceToTagIds": {str(i + 1): [tag_names.index(t) + 1] for i, (t, _) in enumerate(TAGGED)},
 }
 
-service_def = json.load(open(sys.argv[1]))
+service_def = json.load(open(SERVICE_DEF))
 # What Ranger Admin adds to the definition of a service linked to a tag service.
 service_def["contextEnrichers"] = [{
     "itemId": 1, "name": "TagEnricher", "enricher": "org.apache.ranger.plugin.contextenricher.RangerTagEnricher",
     "enricherOptions": {"tagRetrieverClassName": "org.apache.ranger.plugin.contextenricher.RangerAdminTagRetriever",
                         "tagRefresherPollingInterval": "10000"}}]
-tag_def = json.load(open(sys.argv[2]))
-json.dump({"serviceName": "e2e", "serviceId": 1, "policyVersion": 1, "serviceDef": service_def,
-           "policies": policies, "auditMode": "audit-default",
-           "tagPolicies": {"serviceName": "e2e_tag", "serviceId": 2, "policyVersion": 1, "serviceDef": tag_def,
-                           "policies": tag_policies, "auditMode": "audit-default"}},
-          open(sys.argv[3], "w"))
-json.dump(service_tags, open(sys.argv[4], "w"))
-print(f"wrote {len(policies)} policies, {len(tag_policies)} tag policies to {sys.argv[3]}, "
-      f"{len(TAGGED)} tag attachments to {sys.argv[4]}")
+tag_def = json.load(open(TAG_DEF))
+
+
+def write_atomically(path, document):
+    """fakeranger.py reads the files on every request, also while a run publishes a new version: write a
+    temporary file in the same directory and rename it over the served one, so a reader never sees half a file."""
+    tmp = os.path.join(os.path.dirname(os.path.abspath(path)), f".{os.path.basename(path)}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(document, f)
+    os.replace(tmp, path)
+
+
+write_atomically(POLICIES_OUT, {
+    "serviceName": "e2e", "serviceId": 1, "policyVersion": POLICY_VERSION, "serviceDef": service_def,
+    "policies": policies, "auditMode": "audit-default",
+    "tagPolicies": {"serviceName": "e2e_tag", "serviceId": 2, "policyVersion": 1, "serviceDef": tag_def,
+                    "policies": tag_policies, "auditMode": "audit-default"}})
+write_atomically(TAGS_OUT, service_tags)
+print(f"wrote {len(policies)} policies, {len(tag_policies)} tag policies to {POLICIES_OUT}, "
+      f"{len(TAGGED)} tag attachments to {TAGS_OUT}")

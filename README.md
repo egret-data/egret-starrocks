@@ -97,6 +97,30 @@ orders row filter also applies to root.
 The local build used JDK 21 with `--release 17`; the official jars are built with JDK 17 and contain
 681 more synthetic `$N` switch-map classes (no other class differs in name). CI builds with JDK 17.
 
+## Probe: unmeasured paths
+
+`tests/e2e/probe.sh <allin1-image>` is a second, read-oriented harness that measures paths the
+patch checks above do not reach: non-Iceberg catalogs (JDBC, Hive, Paimon), stream and routine
+load, and the CN/BE/FE ports from inside the engine's network namespace. Unlike `run.sh` it is
+not a gate — every check prints a verdict (`ENFORCED`, `LEAK`, `BLIND`, `N/A`, `SKIP`, `ERROR`,
+see `tests/e2e/probe_lib.py`); the run fails only on `BLIND` or `ERROR`. `BE_HTTP_AUTH=1` runs the
+`enable_http_auth` mitigation variant. The probe starts Hive Metastore, PostgreSQL, Kafka and the
+object store as the paths need them, on the `egs-probe-net` network.
+
+Result on 2026-11-09 (verdict counts; 0 `BLIND`, 0 `ERROR` in all three runs):
+
+| Run | ENFORCED | LEAK | N/A |
+|---|---|---|---|
+| official `4.1.7` | 47 | 34 | 3 |
+| egret `4.1.7-egret.4` | 68 | 14 | 2 |
+| egret + `enable_http_auth` | 81 | 8 | 2 |
+
+The fork closes the catalog policy-rewrite family (C3–C13 on every connector) that leaks on the
+official image; `enable_http_auth` closes the anonymous BE-HTTP family (N2–N5, N11, S8-anon);
+eight leaks survive both and are tracked as follow-ups FU-1…FU-11 in the probe findings report.
+The probe files that carry a confirmed leak are held on the `test/probe-unmeasured-paths` branch
+and are not published here until those follow-ups land.
+
 ## Known limits (not patched)
 
 - `root` is not checked by Ranger (upstream [#72198](https://github.com/StarRocks/starrocks/issues/72198)); it
