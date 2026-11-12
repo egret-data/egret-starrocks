@@ -166,7 +166,10 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
 
     def c14_actual():
         sql, name, _ = c14_listing()
-        return {"via": name, "bob": text("bob", sql)}
+        b = text("bob", sql)
+        if is_failure(b):  # bob's listing request failed (not a refusal): ERROR, not a false ENFORCED
+            return b
+        return {"via": name, "bob": b}
 
     def c14_leaked(r):
         b = r["bob"]
@@ -288,7 +291,10 @@ def checks_for(c: Catalog) -> list[ProbeCheck]:
             return r == []
 
         def c16_actual():
-            return {"eve": text("eve", other_catalog(f"c16_{c.name}_eve_{RUN_ID}"))}
+            r = text("eve", other_catalog(f"c16_{c.name}_eve_{RUN_ID}"))
+            if is_failure(r):  # eve's request failed (not a refusal): the check reads ERROR, not a leak
+                return r
+            return {"eve": r}
 
         def c16_leaked(r):
             return r["eve"] != DENIED
