@@ -100,16 +100,35 @@ start_postgres() {
     docker run -d --name "$NAME-pg" --network "$NET" --network-alias pg \
         -e POSTGRES_PASSWORD=pgsecret -e POSTGRES_DB=sales "$PG_IMAGE" >/dev/null
     for _ in $(seq 1 30); do
-        docker exec "$NAME-pg" pg_isready -U postgres -d sales >/dev/null 2>&1 && return 0
+        # Over TCP: the image's init server listens on the socket only, and restarts before it is ready.
+        docker exec "$NAME-pg" pg_isready -h 127.0.0.1 -U postgres -d sales >/dev/null 2>&1 && return 0
         sleep 2
     done
     echo "Postgres never became ready" >&2
     return 1
 }
 
+# The stock image cannot create an s3:// location ("Failed to create external path s3://..."): hive-conf/ adds
+# the S3A settings for RustFS, and HADOOP_OPTIONAL_TOOLS puts the hadoop-aws jars the image already ships on the
+# classpath, so no image is built.
 start_hive_metastore() {
     docker run -d --name "$NAME-hms" --network "$NET" --network-alias hive-metastore \
-        -e SERVICE_NAME=metastore -e DB_DRIVER=derby "$HIVE_IMAGE" >/dev/null
+        -e SERVICE_NAME=metastore -e DB_DRIVER=derby -e HADOOP_OPTIONAL_TOOLS=hadoop-aws \
+        -e HIVE_CUSTOM_CONF_DIR=/opt/egret-probe/hive-conf -v "$HERE/hive-conf:/opt/egret-probe/hive-conf:ro" \
+        "$HIVE_IMAGE" >/dev/null
+}
+
+# The metastore initialises its Derby schema before it listens: wait for its thrift port (the image has bash,
+# no nc or curl). Called by seed_hive, so the schema init overlaps the StarRocks start-up.
+wait_hive_metastore() {
+    for _ in $(seq 1 60); do
+        docker exec "$NAME-hms" bash -c 'exec 3<>/dev/tcp/127.0.0.1/9083' 2>/dev/null && return 0
+        if docker ps -a --filter "name=$NAME-hms" --format '{{.Status}}' | grep -q Exited; then break; fi
+        sleep 2
+    done
+    docker logs "$NAME-hms" 2>&1 | tail -20
+    echo "the Hive Metastore never listened on 9083" >&2
+    return 1
 }
 
 # Kafka in KRaft mode with a PLAINTEXT listener (9092) and a SASL_PLAINTEXT one (9093, PLAIN, user probe).
@@ -132,6 +151,11 @@ if ! skipped hive; then start_hive_metastore; fi
 if ! skipped routine-load; then start_kafka; fi
 
 stack_conf
+# The metastore's first S3A call (class loading) outlasts the FE's 10 s metastore timeout: the FE retries, the
+# retry fails on the duplicate and rolls the first call's directory back. Not mutable at run time, so fe.conf.
+if ! skipped hive; then
+    printf 'hive_meta_store_timeout_s = 60\n' >> "$WORK/fe.conf"
+fi
 # The mitigation variants edit the conf the container is about to read.
 if [ "${BE_HTTP_AUTH:-0}" = 1 ]; then
     printf 'enable_http_auth = true\n' >> "$WORK/be.conf"
@@ -147,8 +171,48 @@ stack_auditloader
 stack_wait_policies
 stack_wait_tags
 
-# Each probe's seed: later tasks fill these in (catalogs: tasks 3 and 4; loads: task 5).
-seed_catalogs() { :; }
+# The PostgreSQL JDBC driver, from Maven Central, pinned by version and sha256 (its sha1 matches the .sha1
+# Maven Central publishes). The canary serves it: the FE and the BE fetch driver_url themselves.
+PG_DRIVER=postgresql-42.7.8.jar
+PG_DRIVER_URL=https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.8/$PG_DRIVER
+PG_DRIVER_SHA256=2a32a9dcbc42d67a50ad3a0de5efd102c8d2be46720045f2cbd6689f160ab7c7
+
+# Postgres holds sales.orders (a schema is a database of a StarRocks JDBC catalog), the rows of ORDERS_ALL in
+# checks.py. The catalog is created as root, with the keys egret's renderer writes, on one line: C15 finds the
+# statement in the audit trail by its text.
+seed_jdbc() {
+    curl -sfL -o "$WORK/canary-files/$PG_DRIVER" "$PG_DRIVER_URL"
+    echo "$PG_DRIVER_SHA256  $WORK/canary-files/$PG_DRIVER" | shasum -a 256 -c - >/dev/null \
+        || { echo "$PG_DRIVER: sha256 mismatch" >&2; exit 1; }
+    docker exec -i "$NAME-pg" psql -q -U postgres -d sales -v ON_ERROR_STOP=1 <<'SQL'
+CREATE SCHEMA sales;
+CREATE TABLE sales.orders (id BIGINT, region TEXT, email TEXT);
+INSERT INTO sales.orders VALUES (1, 'us', 'a@x.io'), (2, 'eu', 'b@x.io'), (3, 'us', 'c@x.io'), (4, 'eu', 'd@x.io');
+SQL
+    root -e "CREATE EXTERNAL CATALOG jdbc PROPERTIES (\"type\" = \"jdbc\", \"user\" = \"postgres\", \"password\" = \"pgsecret\", \"jdbc_uri\" = \"jdbc:postgresql://pg:5432/sales\", \"driver_url\" = \"http://host.docker.internal:$CANARY_PORT/files/$PG_DRIVER\", \"driver_class\" = \"org.postgresql.Driver\")"
+    root -N -e 'SELECT count(*) FROM jdbc.sales.orders' | grep -qx 4 || { echo "jdbc.sales.orders: not 4 rows" >&2; exit 1; }
+    echo "seeded jdbc.sales.orders"
+}
+
+# The Hive catalog holds the RustFS keys; the table is created and filled through it, as root, partitioned by
+# region (StarRocks puts partition columns last: id, email, region). Its CREATE is one line, as jdbc's.
+seed_hive() {
+    wait_hive_metastore
+    root -e "CREATE EXTERNAL CATALOG hive PROPERTIES (\"type\" = \"hive\", \"hive.metastore.uris\" = \"thrift://hive-metastore:9083\", \"aws.s3.endpoint\" = \"http://s3:9000\", \"aws.s3.enable_path_style_access\" = \"true\", \"aws.s3.access_key\" = \"e2e\", \"aws.s3.secret_key\" = \"e2esecret\", \"aws.s3.region\" = \"us-east-1\")"
+    root <<'SQL'
+CREATE DATABASE hive.sales PROPERTIES ("location" = "s3://warehouse/hive/sales");
+CREATE TABLE hive.sales.orders (id BIGINT, email STRING, region STRING) PARTITION BY (region);
+INSERT INTO hive.sales.orders VALUES (1, 'a@x.io', 'us'), (2, 'b@x.io', 'eu'), (3, 'c@x.io', 'us'), (4, 'd@x.io', 'eu');
+SQL
+    root -N -e 'SELECT count(*) FROM hive.sales.orders' | grep -qx 4 || { echo "hive.sales.orders: not 4 rows" >&2; exit 1; }
+    echo "seeded hive.sales.orders"
+}
+
+# Each probe's seed: later tasks fill these in (paimon: task 4; loads: task 5).
+seed_catalogs() {
+    if ! skipped jdbc; then seed_jdbc; fi
+    if ! skipped hive; then seed_hive; fi
+}
 seed_loads() { :; }
 seed_in_namespace() { :; }
 seed_catalogs

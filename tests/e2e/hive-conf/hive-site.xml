@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<!-- probe.sh's Hive Metastore. It replaces the image's hive-site.xml (whose other settings are for HiveServer2
+     and Tez), keeping its warehouse dir and notification setting. The empty transformer stops Hive 4 from turning
+     StarRocks' managed tables into external ones, which StarRocks refuses to INSERT into. -->
+<configuration>
+  <property><name>hive.metastore.warehouse.dir</name><value>/opt/hive/data/warehouse</value></property>
+  <property><name>metastore.metastore.event.db.notification.api.auth</name><value>false</value></property>
+  <property><name>metastore.metadata.transformer.class</name><value> </value></property>
+</configuration>

@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<!-- probe.sh's Hive Metastore: s3:// locations on the probe's RustFS, through the hadoop-aws jars the
+     apache/hive image already ships in /opt/hadoop/share/hadoop/tools/lib (HADOOP_OPTIONAL_TOOLS=hadoop-aws). -->
+<configuration>
+  <property><name>fs.s3.impl</name><value>org.apache.hadoop.fs.s3a.S3AFileSystem</value></property>
+  <property><name>fs.s3a.endpoint</name><value>http://s3:9000</value></property>
+  <property><name>fs.s3a.endpoint.region</name><value>us-east-1</value></property>
+  <property><name>fs.s3a.path.style.access</name><value>true</value></property>
+  <property><name>fs.s3a.connection.ssl.enabled</name><value>false</value></property>
+  <property><name>fs.s3a.access.key</name><value>e2e</value></property>
+  <property><name>fs.s3a.secret.key</name><value>e2esecret</value></property>
+</configuration>
