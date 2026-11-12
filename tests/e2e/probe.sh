@@ -328,11 +328,10 @@ inns_discover() {
     fi
     [ -n "$INNS_SEG_PATH" ] && INNS_SEG_SHA=$(docker exec "$NAME-sr" sh -c "sha256sum '$INNS_SEG_PATH' 2>/dev/null" | awk '{print $1}')
     echo "inns N5 segment: tablet ${tabletid:-none}, path ${INNS_SEG_PATH:-none}, sha256 ${INNS_SEG_SHA:-none}"
-    # N3: prefer the S4 load label (proves a recent real load leaks); else a token the BE always logs.
+    # N3: the S4 load label (proves a recent real load leaks). No weak fallback: a token the log trivially
+    # contains would make greplog's leak unfalsifiable. If the label is not in be.INFO the sight fails (BLIND).
     if docker exec "$NAME-sr" sh -c "grep -q 'S4-$RUN_ID' '$BE_INFO' 2>/dev/null"; then
         INNS_N3_PATTERN="S4-$RUN_ID" INNS_N3_SIGHT=ok
-    elif docker exec "$NAME-sr" sh -c "grep -q 'StarRocks' '$BE_INFO' 2>/dev/null"; then
-        INNS_N3_PATTERN=StarRocks INNS_N3_SIGHT=ok
     fi
     echo "inns N3 pattern: ${INNS_N3_PATTERN:-none} (sight $INNS_N3_SIGHT)"
 }

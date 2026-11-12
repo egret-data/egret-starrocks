@@ -29,6 +29,7 @@ import base64
 import hashlib
 import http.client
 import os
+import re
 import socket
 import struct
 import sys
@@ -277,13 +278,18 @@ def write_getdbnames(username, host):
     return f
 
 
-# FrontendService.thrift:2483  TMasterOpResult forward(1: TMasterOpRequest params)
-#   struct TMasterOpRequest { 1: required string user; 2: required string db;
-#       3: required string sql; ... 14: current_user_ident }    FrontendService.thrift:910-935
-# Only the three required fields are written (the brief).
+# FrontendService.thrift:2483  TMasterOpResult forward(TMasterOpRequest params)
+#   The IDL gives `params` no explicit field id, so Thrift auto-assigns it -1: the generated
+#   forward_args.PARAMS_FIELD_DESC = new TField("params", STRUCT, (short)-1) (FrontendService.java:32148).
+#   Writing it at any other id makes the server skip an unknown field, leave params null and NPE, which
+#   looks like a refusal but is a self-inflicted malformed request. So the struct MUST go at field id -1.
+#   struct TMasterOpRequest { 1: required string user; 2: required string db; 3: required string sql;
+#       ... 14: current_user_ident }  (FrontendService.thrift:910-935; only these three are REQUIRED,
+#   confirmed in TMasterOpRequest.java FieldMetaData). The three are written so the request is well-formed
+#   up to the authorization check.
 def write_forward(user, db, sql):
     def f(w):
-        w.field(T_STRUCT, 1)                       # forward_args.params (field 1)
+        w.field(T_STRUCT, -1)                      # forward_args.params (auto-assigned field -1)
         w.field_string(1, user)                    # TMasterOpRequest.user (field 1, required)
         w.field_string(2, db)                      # TMasterOpRequest.db   (field 2, required)
         w.field_string(3, sql)                     # TMasterOpRequest.sql  (field 3, required)
@@ -452,7 +458,11 @@ def n8_sight():
 
 
 def n9_actual():
-    # forward(TMasterOpRequest as root, SELECT 1) (H6): expected ENFORCED ("request from invalid host").
+    # forward(TMasterOpRequest as root, SELECT 1) (H6): expected ENFORCED. The request is well-formed (params
+    # at field -1), so the FE reaches getFeByHost() and rejects a caller that is not a registered FE
+    # (FrontendServiceImpl.forward():1214-1216, "request from invalid host was rejected."). That TException is
+    # wrapped by Thrift's ProcessFunction into the opaque client message "Internal error processing forward";
+    # the real mechanism is confirmed in fe.warn.log ("reject request from invalid host. client: ...").
     kind, body = thrift_call(FE_THRIFT, "forward", write_forward("root", "", "SELECT 1"))
     strings = []
     collect_strings(body, strings)
@@ -490,8 +500,10 @@ def n10_metrics_actual():
     # FE /metrics is recorded: whether it names tables or users (not just metric names).
     status, body = http_req("GET", FE_HTTP, "/metrics", auth=args._n10_auth)
     text = body.decode(errors="replace")
+    # Word-boundary match: a short token like `eve`/`bob` must not match inside a metric or label name
+    # (e.g. `events`). \b treats `_` as a word char, so Prometheus identifiers are respected.
     names = [t for t in ("demo", "customers", "orders", "alice", "bob", "eve", "loader", "mallory")
-             if t in text]
+             if re.search(rf"\b{re.escape(t)}\b", text)]
     detail("N10-metrics", f"GET :{FE_HTTP}/metrics -> http {status}, {len(body)} bytes, identifiers seen: {names}")
     return {"http": status, "names": names}
 
