@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: egret <noreply@egret.local>
+Date: Fri, 27 Nov 2026 15:00:44 +0700
+Subject: [PATCH] Purge an Iceberg REST table on DROP TABLE ... FORCE
+
+IcebergRESTCatalog#dropTable ignored its purge argument and always called
+RESTSessionCatalog#dropTable, so DROP TABLE ... FORCE sent DELETE .../tables/<t>
+without purgeRequested=true. A REST catalog server (Polaris, ...) then removed only
+the catalog entry and every data, manifest and metadata file stayed in object
+storage. Call RESTSessionCatalog#purgeTable when purge is requested. A plain DROP
+TABLE is unchanged. A server that refuses the purge (Polaris without
+drop-with-purge enabled) now fails the statement with its message and keeps the
+table, instead of silently orphaning its files.
+---
+ .../iceberg/rest/IcebergRESTCatalog.java      |  8 ++-
+ .../iceberg/IcebergRESTCatalogTest.java       | 54 ++++++++++++++++++-
+ 2 files changed, 59 insertions(+), 3 deletions(-)
+
+diff --git a/fe/fe-core/src/main/java/com/starrocks/connector/iceberg/rest/IcebergRESTCatalog.java b/fe/fe-core/src/main/java/com/starrocks/connector/iceberg/rest/IcebergRESTCatalog.java
+index df236d01..0c164768 100644
+--- a/fe/fe-core/src/main/java/com/starrocks/connector/iceberg/rest/IcebergRESTCatalog.java
++++ b/fe/fe-core/src/main/java/com/starrocks/connector/iceberg/rest/IcebergRESTCatalog.java
+@@ -382,9 +382,13 @@ public class IcebergRESTCatalog implements IcebergCatalog {
+ 
+     @Override
+     public boolean dropTable(ConnectContext context, String dbName, String tableName, boolean purge) {
++        // DROP TABLE ... FORCE asks for a purge: send purgeRequested=true so the catalog server deletes the table's
++        // files (Iceberg REST spec). Without it the server only removes the catalog entry and the files stay.
++        TableIdentifier identifier = TableIdentifier.of(convertDbNameToNamespace(dbName), tableName);
+         try {
+-            return withAuthRecovery(() -> delegate.get().dropTable(buildContext(context),
+-                    TableIdentifier.of(convertDbNameToNamespace(dbName), tableName)));
++            return withAuthRecovery(() -> purge
++                    ? delegate.get().purgeTable(buildContext(context), identifier)
++                    : delegate.get().dropTable(buildContext(context), identifier));
+         } catch (RESTException re) {
+             LOG.error("Failed to drop table using REST Catalog, for dbName {} tableName {}", dbName, tableName, re);
+             throw new StarRocksConnectorException("Failed to drop table using REST Catalog", re);
+diff --git a/fe/fe-core/src/test/java/com/starrocks/connector/iceberg/IcebergRESTCatalogTest.java b/fe/fe-core/src/test/java/com/starrocks/connector/iceberg/IcebergRESTCatalogTest.java
+index 8ae92fde..298c3266 100644
+--- a/fe/fe-core/src/test/java/com/starrocks/connector/iceberg/IcebergRESTCatalogTest.java
++++ b/fe/fe-core/src/test/java/com/starrocks/connector/iceberg/IcebergRESTCatalogTest.java
+@@ -43,6 +43,7 @@ import mockit.Expectations;
+ import mockit.Mock;
+ import mockit.MockUp;
+ import mockit.Mocked;
++import mockit.Verifications;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.iceberg.Schema;
+ import org.apache.iceberg.catalog.Namespace;
+@@ -776,4 +777,55 @@ public class IcebergRESTCatalogTest {
+                 "Failed to load table metadata using REST Catalog",
+                 () -> icebergRESTCatalog.loadNamespaceMetadata(connectContext, Namespace.of("db")));
+     }
+-}
+\ No newline at end of file
++
++    @Test
++    public void testDropTableWithoutPurgeKeepsFiles(@Mocked RESTSessionCatalog restCatalog) {
++        IcebergRESTCatalog icebergRESTCatalog = new IcebergRESTCatalog(restCatalog, new Configuration());
++
++        icebergRESTCatalog.dropTable(connectContext, "db", "tbl", false);
++
++        new Verifications() {
++            {
++                restCatalog.dropTable((SessionContext) any, TableIdentifier.of("db", "tbl"));
++                times = 1;
++                restCatalog.purgeTable((SessionContext) any, (TableIdentifier) any);
++                times = 0;
++            }
++        };
++    }
++
++    @Test
++    public void testDropTableWithPurgeRequestsPurge(@Mocked RESTSessionCatalog restCatalog) {
++        IcebergRESTCatalog icebergRESTCatalog = new IcebergRESTCatalog(restCatalog, new Configuration());
++        new Expectations() {
++            {
++                restCatalog.purgeTable((SessionContext) any, TableIdentifier.of("db", "tbl"));
++                result = true;
++            }
++        };
++
++        assertTrue(icebergRESTCatalog.dropTable(connectContext, "db", "tbl", true));
++
++        new Verifications() {
++            {
++                restCatalog.purgeTable((SessionContext) any, TableIdentifier.of("db", "tbl"));
++                times = 1;
++                restCatalog.dropTable((SessionContext) any, (TableIdentifier) any);
++                times = 0;
++            }
++        };
++    }
++
++    @Test
++    public void testPurgeTableRESTExceptionPropagation(@Mocked RESTSessionCatalog restCatalog) {
++        IcebergRESTCatalog icebergRESTCatalog = new IcebergRESTCatalog(restCatalog, new Configuration());
++        new Expectations() {
++            {
++                restCatalog.purgeTable((SessionContext) any, (TableIdentifier) any);
++                result = new RESTException("purge is not enabled");
++            }
++        };
++        ExceptionChecker.expectThrowsWithMsg(StarRocksConnectorException.class, "Failed to drop table using REST Catalog",
++                () -> icebergRESTCatalog.dropTable(connectContext, "db", "tbl", true));
++    }
++}
